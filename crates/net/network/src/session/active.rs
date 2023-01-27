@@ -143,7 +143,7 @@ impl ActiveSession {
                         self.on_bad_message();
                     }
                 } else {
-                    self.on_bad_message()
+                    // NADA for now
                 }
             };
         }
@@ -382,7 +382,7 @@ impl Future for ActiveSession {
         let this = self.get_mut();
 
         if this.is_disconnecting() {
-            return this.poll_disconnect(cx)
+            return this.poll_disconnect(cx);
         }
 
         loop {
@@ -395,7 +395,7 @@ impl Future for ActiveSession {
                     Poll::Ready(None) => {
                         // this is only possible when the manager was dropped, in which case we also
                         // terminate this session
-                        return Poll::Ready(())
+                        return Poll::Ready(());
                     }
                     Poll::Ready(Some(cmd)) => {
                         progress = true;
@@ -415,7 +415,7 @@ impl Future for ActiveSession {
                                         this.close_on_error(err);
                                         Poll::Ready(())
                                     }
-                                }
+                                };
                             }
                             SessionCommand::Message(msg) => {
                                 this.on_peer_message(msg);
@@ -459,11 +459,11 @@ impl Future for ActiveSession {
                         error!(target: "net::session", ?err,  remote_peer_id=?this.remote_peer_id, "failed to send message");
                         // notify the manager
                         this.close_on_error(err);
-                        return Poll::Ready(())
+                        return Poll::Ready(());
                     }
                 } else {
                     // no more messages to send over the wire
-                    break
+                    break;
                 }
             }
 
@@ -472,11 +472,11 @@ impl Future for ActiveSession {
                     Poll::Pending => break,
                     Poll::Ready(None) => {
                         if this.is_disconnecting() {
-                            break
+                            break;
                         } else {
                             debug!(target: "net::session", remote_peer_id=?this.remote_peer_id, "eth stream completed");
                             this.emit_disconnect();
-                            return Poll::Ready(())
+                            return Poll::Ready(());
                         }
                     }
                     Poll::Ready(Some(res)) => {
@@ -488,13 +488,13 @@ impl Future for ActiveSession {
                                 if let Some((err, bad_protocol_msg)) = this.on_incoming(msg) {
                                     error!(target: "net::session", ?err, msg=?bad_protocol_msg,  remote_peer_id=?this.remote_peer_id, "received invalid protocol message");
                                     this.close_on_error(err);
-                                    return Poll::Ready(())
+                                    return Poll::Ready(());
                                 }
                             }
                             Err(err) => {
                                 error!(target: "net::session", ?err, remote_peer_id=?this.remote_peer_id, "failed to receive message");
                                 this.close_on_error(err);
-                                return Poll::Ready(())
+                                return Poll::Ready(());
                             }
                         }
                     }
@@ -507,7 +507,7 @@ impl Future for ActiveSession {
                     this.evict_timed_out_requests(Instant::now());
                 }
 
-                return Poll::Pending
+                return Poll::Pending;
             }
         }
     }
