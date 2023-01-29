@@ -34,7 +34,7 @@ impl Default for SessionsConfig {
             // `buffer + num sessions`. Each session can therefore fit at least 1 message in the
             // channel. The buffer size is additional capacity. The channel is always drained on
             // `poll`.
-            session_event_buffer: 16384,
+            session_event_buffer: 65536,
             limits: Default::default(),
             request_timeout: INITIAL_REQUEST_TIMEOUT,
         }
