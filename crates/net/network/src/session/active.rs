@@ -80,7 +80,7 @@ pub(crate) struct ActiveSession {
 /// Constants for timeout updating
 
 /// Minimum timeout value
-const MINIMUM_TIMEOUT: Duration = Duration::from_millis(1);
+const MINIMUM_TIMEOUT: Duration = Duration::from_secs(2);
 /// Maximum timeout value
 const MAXIMUM_TIMEOUT: Duration = INITIAL_REQUEST_TIMEOUT;
 /// How much the new measurements affect the current timeout (X percent)
