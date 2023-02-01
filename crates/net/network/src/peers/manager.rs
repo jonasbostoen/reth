@@ -949,8 +949,8 @@ impl Default for PeersConfig {
             connection_info: Default::default(),
             reputation_weights: Default::default(),
             ban_list: Default::default(),
-            // Ban peers for 12h
-            ban_duration: Duration::from_secs(60 * 60 * 12),
+            // Ban peers for 1h
+            ban_duration: Duration::from_secs(60 * 60),
             backoff_durations: Default::default(),
             trusted_nodes: Default::default(),
             connect_trusted_nodes_only: false,
