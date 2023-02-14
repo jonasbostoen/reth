@@ -163,6 +163,11 @@ impl PeersManager {
         PeersHandle { manager_tx: self.manager_tx.clone() }
     }
 
+    /// Returns an iterator over all peers
+    pub(crate) fn iter_peers(&self) -> impl Iterator<Item = NodeRecord> + '_ {
+        self.peers.iter().map(|(peer_id, v)| NodeRecord::new(v.addr, *peer_id))
+    }
+
     /// Invoked when a new _incoming_ tcp connection is accepted.
     ///
     /// returns an error if the inbound ip address is on the ban list or
