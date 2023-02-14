@@ -1,4 +1,4 @@
-use crate::{
+se crate::{
     error::{BackoffKind, SessionError},
     peers::{
         reputation::{is_banned_reputation, BACKOFF_REPUTATION_CHANGE, DEFAULT_REPUTATION},
@@ -161,11 +161,6 @@ impl PeersManager {
     /// Returns a new [`PeersHandle`] that can send commands to this type.
     pub(crate) fn handle(&self) -> PeersHandle {
         PeersHandle { manager_tx: self.manager_tx.clone() }
-    }
-
-    /// Returns an iterator over all peers
-    pub(crate) fn iter_peers(&self) -> impl Iterator<Item = NodeRecord> + '_ {
-        self.peers.iter().map(|(peer_id, v)| NodeRecord::new(v.addr, *peer_id))
     }
 
     /// Invoked when a new _incoming_ tcp connection is accepted.
@@ -643,7 +638,9 @@ impl PeersManager {
                         let _ = tx.send(self.peers.get(&peer).cloned());
                     }
                     PeerCommand::GetPeers(tx) => {
-                        let _ = tx.send(self.iter_peers().collect());
+                        let _ = tx.send(
+                            self.peers.iter().map(|(k, v)| NodeRecord::new(v.addr, *k)).collect(),
+                        );
                     }
                 }
             }
@@ -971,7 +968,7 @@ impl Default for PeersConfig {
             reputation_weights: Default::default(),
             ban_list: Default::default(),
             // Ban peers for 12h
-            ban_duration: Duration::from_secs(60 * 60 * 12),
+            ban_duration: Duration::from_secs(60 * 60),
             backoff_durations: Default::default(),
             trusted_nodes: Default::default(),
             connect_trusted_nodes_only: false,
