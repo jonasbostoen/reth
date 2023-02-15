@@ -608,6 +608,8 @@ impl PeersManager {
                     break;
                 }
 
+                info!(target: "patch", ?peer, "Peer scheduled for outbound connection");
+
                 trace!(target : "net::peers",  ?peer_id, addr=?peer.addr, "schedule outbound connection");
 
                 peer.state = PeerConnectionState::Out;
