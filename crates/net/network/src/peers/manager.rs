@@ -595,6 +595,7 @@ impl PeersManager {
     /// New connections are only initiated, if slots are available and appropriate peers are
     /// available.
     fn fill_outbound_slots(&mut self) {
+        let peer_len = self.peers.len();
         // as long as there a slots available try to fill them with the best peers
         while self.connection_info.has_out_capacity() {
             let action = {
@@ -608,7 +609,7 @@ impl PeersManager {
                     break;
                 }
 
-                info!(target: "patch", ?peer, "Peer scheduled for outbound connection");
+                info!(target: "patch", ?peer, ?peer_id, total_peers = peer_len, "Peer scheduled for outbound connection");
 
                 trace!(target : "net::peers",  ?peer_id, addr=?peer.addr, "schedule outbound connection");
 
