@@ -28,7 +28,7 @@ use std::{
     task::{Context, Poll},
 };
 use tokio::sync::oneshot;
-use tracing::{debug, error};
+use tracing::{debug, error, info};
 
 /// Cache limit of blocks to keep track of for a single peer.
 const PEER_BLOCK_CACHE_LIMIT: usize = 512;
@@ -169,7 +169,7 @@ where
         for (peer_id, peer) in self.active_peers.iter_mut() {
             if peer.blocks.contains(&msg.hash) {
                 // skip peers which already reported the block
-                continue
+                continue;
             }
 
             // Queue a `NewBlock` message for the peer
@@ -189,7 +189,7 @@ where
             }
 
             if count >= num_propagate {
-                break
+                break;
             }
         }
     }
@@ -202,7 +202,7 @@ where
         for (peer_id, peer) in self.active_peers.iter_mut() {
             if peer.blocks.contains(&msg.hash) {
                 // skip peers which already reported the block
-                continue
+                continue;
             }
 
             if self.state_fetcher.update_peer_block(peer_id, msg.hash, number) {
@@ -275,6 +275,7 @@ where
     fn on_discovery_event(&mut self, event: DiscoveryEvent) {
         match event {
             DiscoveryEvent::Discovered { peer_id, socket_addr, fork_id } => {
+                info!(target: "patch", ?peer_id, ?socket_addr, ?fork_id, "Discovered new node");
                 self.queued_messages.push_back(StateAction::DiscoveredNode {
                     peer_id,
                     socket_addr,
@@ -379,7 +380,7 @@ where
         loop {
             // drain buffered messages
             if let Some(message) = self.queued_messages.pop_front() {
-                return Poll::Ready(message)
+                return Poll::Ready(message);
             }
 
             while let Poll::Ready(discovery) = self.discovery.poll(cx) {
@@ -443,7 +444,7 @@ where
             }
 
             if self.queued_messages.is_empty() {
-                return Poll::Pending
+                return Poll::Pending;
             }
         }
     }

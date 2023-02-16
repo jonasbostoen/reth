@@ -163,7 +163,7 @@ impl Discovery {
         loop {
             // Drain all buffered events first
             if let Some(event) = self.queued_events.pop_front() {
-                return Poll::Ready(event)
+                return Poll::Ready(event);
             }
 
             // drain the update streams
@@ -180,7 +180,7 @@ impl Discovery {
             }
 
             if self.queued_events.is_empty() {
-                return Poll::Pending
+                return Poll::Pending;
             }
         }
     }
