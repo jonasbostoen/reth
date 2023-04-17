@@ -1,8 +1,23 @@
-//! Table and data structures
+//! Tables and data models.
+//!
+//! # Overview
+//!
+//! This module defines the tables in reth, as well as some table-related abstractions:
+//!
+//! - [`codecs`] integrates different codecs into [`Encode`](crate::abstraction::table::Encode) and
+//!   [`Decode`](crate::abstraction::table::Decode)
+//! - [`models`] defines the values written to tables
+//!
+//! # Database Tour
+//!
+//! TODO(onbjerg): Find appropriate format for this...
 
 pub mod codecs;
 pub mod models;
-pub mod utils;
+mod raw;
+pub(crate) mod utils;
+
+pub use raw::{RawDubSort, RawKey, RawTable, RawValue};
 
 /// Declaration of all Database tables.
 use crate::{
@@ -12,16 +27,16 @@ use crate::{
         models::{
             accounts::{AccountBeforeTx, TransitionIdAddress},
             blocks::{HeaderHash, StoredBlockOmmers},
-            ShardedKey,
+            storage_sharded_key::StorageShardedKey,
+            ShardedKey, StoredBlockBodyIndices, StoredBlockWithdrawals,
         },
     },
 };
 use reth_primitives::{
-    Account, Address, BlockHash, BlockNumber, Header, IntegerList, Receipt, StorageEntry,
-    StorageTrieEntry, TransactionSigned, TransitionId, TxHash, TxNumber, H256,
+    trie::{BranchNodeCompact, StorageTrieEntry, StoredNibbles, StoredNibblesSubKey},
+    Account, Address, BlockHash, BlockNumber, Bytecode, Header, IntegerList, Receipt, StorageEntry,
+    TransactionSigned, TransitionId, TxHash, TxNumber, H256,
 };
-
-use self::models::{storage_sharded_key::StorageShardedKey, StoredBlockBody};
 
 /// Enum for the types of tables present in libmdbx.
 #[derive(Debug)]
@@ -32,23 +47,25 @@ pub enum TableType {
     DupSort,
 }
 
+/// Number of tables that should be present inside database.
+pub const NUM_TABLES: usize = 25;
+
 /// Default tables that should be present inside database.
-pub const TABLES: [(TableType, &str); 26] = [
+pub const TABLES: [(TableType, &str); NUM_TABLES] = [
     (TableType::Table, CanonicalHeaders::const_name()),
     (TableType::Table, HeaderTD::const_name()),
     (TableType::Table, HeaderNumbers::const_name()),
     (TableType::Table, Headers::const_name()),
-    (TableType::Table, BlockBodies::const_name()),
+    (TableType::Table, BlockBodyIndices::const_name()),
     (TableType::Table, BlockOmmers::const_name()),
+    (TableType::Table, BlockWithdrawals::const_name()),
+    (TableType::Table, TransactionBlock::const_name()),
     (TableType::Table, Transactions::const_name()),
     (TableType::Table, TxHashNumber::const_name()),
     (TableType::Table, Receipts::const_name()),
-    (TableType::Table, Logs::const_name()),
     (TableType::Table, PlainAccountState::const_name()),
     (TableType::DupSort, PlainStorageState::const_name()),
     (TableType::Table, Bytecodes::const_name()),
-    (TableType::Table, BlockTransitionIndex::const_name()),
-    (TableType::Table, TxTransitionIndex::const_name()),
     (TableType::Table, AccountHistory::const_name()),
     (TableType::Table, StorageHistory::const_name()),
     (TableType::DupSort, AccountChangeSet::const_name()),
@@ -58,12 +75,12 @@ pub const TABLES: [(TableType, &str); 26] = [
     (TableType::Table, AccountsTrie::const_name()),
     (TableType::DupSort, StoragesTrie::const_name()),
     (TableType::Table, TxSenders::const_name()),
-    (TableType::Table, Config::const_name()),
     (TableType::Table, SyncStage::const_name()),
+    (TableType::Table, SyncStageProgress::const_name()),
 ];
 
 #[macro_export]
-/// Macro to declare all necessary tables.
+/// Macro to declare key value table.
 macro_rules! table {
     ($(#[$docs:meta])+ ( $table_name:ident ) $key:ty | $value:ty) => {
         $(#[$docs])+
@@ -93,6 +110,8 @@ macro_rules! table {
     };
 }
 
+#[macro_export]
+/// Macro to declare duplicate key value table.
 macro_rules! dupsort {
     ($(#[$docs:meta])+ ( $table_name:ident ) $key:ty | [$subkey:ty] $value:ty) => {
         table!(
@@ -132,8 +151,11 @@ table!(
 );
 
 table!(
-    /// Stores block bodies.
-    ( BlockBodies ) BlockNumber | StoredBlockBody
+    /// Stores block indices that contains indexes of transaction and transitions,
+    /// number of transactions and if block has a block change (block reward or withdrawals).
+    ///
+    /// More information about stored indices can be found in the [`StoredBlockBodyIndices`] struct.
+    ( BlockBodyIndices ) BlockNumber | StoredBlockBodyIndices
 );
 
 table!(
@@ -142,8 +164,13 @@ table!(
 );
 
 table!(
+    /// Stores the block withdrawals.
+    ( BlockWithdrawals ) BlockNumber | StoredBlockWithdrawals
+);
+
+table!(
     /// (Canonical only) Stores the transaction body for canonical transactions.
-    ( Transactions ) TxNumber | TransactionSigned
+    (  Transactions ) TxNumber | TransactionSigned
 );
 
 table!(
@@ -152,13 +179,15 @@ table!(
 );
 
 table!(
-    /// (Canonical only) Stores transaction receipts.
-    ( Receipts ) TxNumber | Receipt
+    /// Stores the mapping of transaction number to the blocks number.
+    ///
+    /// The key is the highest transaction ID in the block.
+    ( TransactionBlock ) TxNumber | BlockNumber
 );
 
 table!(
-    /// (Canonical only) Stores transaction logs.
-    ( Logs ) TxNumber | Receipt
+    /// (Canonical only) Stores transaction receipts.
+    ( Receipts ) TxNumber | Receipt
 );
 
 table!(
@@ -167,20 +196,6 @@ table!(
     /// So we would need to introduce reference counter.
     /// This will be small optimization on state.
     ( Bytecodes ) H256 | Bytecode
-);
-
-table!(
-    /// Stores the mapping of block number to state transition id.
-    /// The block transition marks the final state at the end of the block.
-    /// Increment the transition if the block contains an addition block reward.
-    /// If the block does not have a reward and transaction, the transition will be the same as the
-    /// transition at the last transaction of this block.
-    ( BlockTransitionIndex ) BlockNumber | TransitionId
-);
-
-table!(
-    /// Stores the mapping of transaction number to state transition id.
-    ( TxTransitionIndex ) TxNumber | TransitionId
 );
 
 table!(
@@ -269,12 +284,12 @@ dupsort!(
 
 table!(
     /// Stores the current state's Merkle Patricia Tree.
-    ( AccountsTrie ) H256 | Vec<u8>
+    ( AccountsTrie ) StoredNibbles | BranchNodeCompact
 );
 
 dupsort!(
-    /// Stores the Merkle Patricia Trees of each [`Account`]'s storage.
-    ( StoragesTrie ) H256 | [H256] StorageTrieEntry
+    /// From HashedAddress => NibblesSubKey => Intermediate value
+    ( StoragesTrie ) H256 | [StoredNibblesSubKey] StorageTrieEntry
 );
 
 table!(
@@ -285,13 +300,13 @@ table!(
 );
 
 table!(
-    /// Configuration values.
-    ( Config ) ConfigKey | ConfigValue
+    /// Stores the highest synced block number of each stage.
+    ( SyncStage ) StageId | BlockNumber
 );
 
 table!(
-    /// Stores the highest synced block number of each stage.
-    ( SyncStage ) StageId | BlockNumber
+    /// Stores arbitrary data to keep track of a stage first-sync progress.
+    ( SyncStageProgress ) StageId | Vec<u8>
 );
 
 ///
@@ -300,15 +315,8 @@ table!(
 /// List with transaction numbers.
 pub type TransitionList = IntegerList;
 /// Encoded stage id.
-pub type StageId = Vec<u8>;
+pub type StageId = String;
 
 //
 // TODO: Temporary types, until they're properly defined alongside with the Encode and Decode Trait
 //
-
-/// Temporary placeholder type for DB.
-pub type ConfigKey = Vec<u8>;
-/// Temporary placeholder type for DB.
-pub type ConfigValue = Vec<u8>;
-/// Temporary placeholder type for DB.
-pub type Bytecode = Vec<u8>;

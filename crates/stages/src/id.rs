@@ -1,4 +1,4 @@
-use crate::stages::{BODIES, HEADERS};
+use crate::stages::{BODIES, FINISH, HEADERS};
 use reth_db::{
     tables::SyncStage,
     transaction::{DbTx, DbTxMut},
@@ -20,14 +20,19 @@ impl Display for StageId {
 }
 
 impl StageId {
-    /// Returns a flag indicating if it's a downloading stage
+    /// Returns true if it's a downloading stage [HEADERS] or [BODIES
     pub fn is_downloading_stage(&self) -> bool {
         *self == HEADERS || *self == BODIES
     }
 
+    /// Returns true indicating if it's the finish stage [FINISH]
+    pub fn is_finish(&self) -> bool {
+        *self == FINISH
+    }
+
     /// Get the last committed progress of this stage.
     pub fn get_progress<'db>(&self, tx: &impl DbTx<'db>) -> Result<Option<BlockNumber>, DbError> {
-        tx.get::<SyncStage>(self.0.as_bytes().to_vec())
+        tx.get::<SyncStage>(self.0.to_string())
     }
 
     /// Save the progress of this stage.
@@ -36,7 +41,7 @@ impl StageId {
         tx: &impl DbTxMut<'db>,
         block: BlockNumber,
     ) -> Result<(), DbError> {
-        tx.put::<SyncStage>(self.0.as_bytes().to_vec(), block)
+        tx.put::<SyncStage>(self.0.to_string(), block)
     }
 }
 

@@ -1,11 +1,11 @@
 use jsonrpsee::{core::RpcResult as Result, proc_macros::rpc};
 use reth_primitives::{
-    rpc::{transaction::eip2930::AccessListWithGasUsed, BlockId},
-    Address, BlockNumber, Bytes, H256, H64, U256, U64,
+    serde_helper::JsonStorageKey, AccessListWithGasUsed, Address, BlockId, BlockNumberOrTag, Bytes,
+    H256, H64, U256, U64,
 };
 use reth_rpc_types::{
-    CallRequest, EIP1186AccountProofResponse, FeeHistory, Index, RichBlock, SyncStatus,
-    Transaction, TransactionReceipt, TransactionRequest, Work,
+    state::StateOverride, CallRequest, EIP1186AccountProofResponse, FeeHistory, Index, RichBlock,
+    SyncStatus, Transaction, TransactionReceipt, TransactionRequest, Work,
 };
 
 /// Eth rpc interface: <https://ethereum.github.io/execution-apis/api-documentation/>
@@ -43,7 +43,11 @@ pub trait EthApi {
 
     /// Returns information about a block by number.
     #[method(name = "eth_getBlockByNumber")]
-    async fn block_by_number(&self, number: BlockNumber, full: bool) -> Result<Option<RichBlock>>;
+    async fn block_by_number(
+        &self,
+        number: BlockNumberOrTag,
+        full: bool,
+    ) -> Result<Option<RichBlock>>;
 
     /// Returns the number of transactions in a block from a block matching the given block hash.
     #[method(name = "eth_getBlockTransactionCountByHash")]
@@ -51,15 +55,18 @@ pub trait EthApi {
 
     /// Returns the number of transactions in a block matching the given block number.
     #[method(name = "eth_getBlockTransactionCountByNumber")]
-    async fn block_transaction_count_by_number(&self, number: BlockNumber) -> Result<Option<U256>>;
+    async fn block_transaction_count_by_number(
+        &self,
+        number: BlockNumberOrTag,
+    ) -> Result<Option<U256>>;
 
     /// Returns the number of uncles in a block from a block matching the given block hash.
     #[method(name = "eth_getUncleCountByBlockHash")]
-    async fn block_uncles_count_by_hash(&self, hash: H256) -> Result<U256>;
+    async fn block_uncles_count_by_hash(&self, hash: H256) -> Result<Option<U256>>;
 
     /// Returns the number of uncles in a block with given block number.
     #[method(name = "eth_getUncleCountByBlockNumber")]
-    async fn block_uncles_count_by_number(&self, number: BlockNumber) -> Result<U256>;
+    async fn block_uncles_count_by_number(&self, number: BlockNumberOrTag) -> Result<Option<U256>>;
 
     /// Returns an uncle block of the given block and index.
     #[method(name = "eth_getUncleByBlockHashAndIndex")]
@@ -73,7 +80,7 @@ pub trait EthApi {
     #[method(name = "eth_getUncleByBlockNumberAndIndex")]
     async fn uncle_by_block_number_and_index(
         &self,
-        number: BlockNumber,
+        number: BlockNumberOrTag,
         index: Index,
     ) -> Result<Option<RichBlock>>;
 
@@ -93,7 +100,7 @@ pub trait EthApi {
     #[method(name = "eth_getTransactionByBlockNumberAndIndex")]
     async fn transaction_by_block_number_and_index(
         &self,
-        number: BlockNumber,
+        number: BlockNumberOrTag,
         index: Index,
     ) -> Result<Option<Transaction>>;
 
@@ -110,7 +117,7 @@ pub trait EthApi {
     async fn storage_at(
         &self,
         address: Address,
-        index: U256,
+        index: JsonStorageKey,
         block_number: Option<BlockId>,
     ) -> Result<H256>;
 
@@ -128,7 +135,12 @@ pub trait EthApi {
 
     /// Executes a new message call immediately without creating a transaction on the block chain.
     #[method(name = "eth_call")]
-    async fn call(&self, request: CallRequest, block_number: Option<BlockId>) -> Result<Bytes>;
+    async fn call(
+        &self,
+        request: CallRequest,
+        block_number: Option<BlockId>,
+        state_overrides: Option<StateOverride>,
+    ) -> Result<Bytes>;
 
     /// Generates an access list for a transaction.
     ///
@@ -174,8 +186,8 @@ pub trait EthApi {
     #[method(name = "eth_feeHistory")]
     async fn fee_history(
         &self,
-        block_count: U256,
-        newest_block: BlockNumber,
+        block_count: U64,
+        newest_block: BlockId,
         reward_percentiles: Option<Vec<f64>>,
     ) -> Result<FeeHistory>;
 
@@ -197,6 +209,10 @@ pub trait EthApi {
     async fn get_work(&self) -> Result<Work>;
 
     /// Used for submitting mining hashrate.
+    ///
+    /// Can be used for remote miners to submit their hash rate.
+    /// It accepts the miner hash rate and an identifier which must be unique between nodes.
+    /// Returns `true` if the block was successfully submitted, `false` otherwise.
     #[method(name = "eth_submitHashrate")]
     async fn submit_hashrate(&self, hashrate: U256, id: H256) -> Result<bool>;
 
@@ -233,7 +249,7 @@ pub trait EthApi {
     async fn get_proof(
         &self,
         address: Address,
-        keys: Vec<H256>,
+        keys: Vec<JsonStorageKey>,
         block_number: Option<BlockId>,
     ) -> Result<EIP1186AccountProofResponse>;
 }

@@ -10,7 +10,7 @@ use crate::{
 use reth_discv4::{Discv4Config, Discv4ConfigBuilder, DEFAULT_DISCOVERY_PORT};
 use reth_primitives::{ChainSpec, ForkFilter, Head, NodeRecord, PeerId, MAINNET};
 use reth_provider::{BlockProvider, HeaderProvider};
-use reth_tasks::TaskExecutor;
+use reth_tasks::{TaskSpawner, TokioTaskExecutor};
 use secp256k1::{SecretKey, SECP256K1};
 use std::{
     collections::HashSet,
@@ -21,7 +21,6 @@ use std::{
 /// reexports for convenience
 #[doc(hidden)]
 mod __reexport {
-    pub use reth_discv4::bootnodes::*;
     pub use secp256k1::SecretKey;
 }
 pub use __reexport::*;
@@ -37,7 +36,7 @@ pub fn rng_secret_key() -> SecretKey {
 /// All network related initialization settings.
 pub struct NetworkConfig<C> {
     /// The client type that can interact with the chain.
-    pub client: Arc<C>,
+    pub client: C,
     /// The node's secret key, from which the node's identity is derived.
     pub secret_key: SecretKey,
     /// All boot nodes to start network discovery with.
@@ -55,7 +54,7 @@ pub struct NetworkConfig<C> {
     /// How to configure the [SessionManager](crate::session::SessionManager).
     pub sessions_config: SessionsConfig,
     /// The chain spec
-    pub chain_spec: ChainSpec,
+    pub chain_spec: Arc<ChainSpec>,
     /// The [`ForkFilter`] to use at launch for authenticating sessions.
     ///
     /// See also <https://github.com/ethereum/EIPs/blob/master/EIPS/eip-2124.md#stale-software-examples>
@@ -68,7 +67,7 @@ pub struct NetworkConfig<C> {
     /// The default mode of the network.
     pub network_mode: NetworkMode,
     /// The executor to use for spawning tasks.
-    pub executor: Option<TaskExecutor>,
+    pub executor: Box<dyn TaskSpawner>,
     /// The `Status` message to send to peers at the beginning.
     pub status: Status,
     /// Sets the hello message for the p2p handshake in RLPx
@@ -79,7 +78,7 @@ pub struct NetworkConfig<C> {
 
 impl<C> NetworkConfig<C> {
     /// Create a new instance with all mandatory fields set, rest is field with defaults.
-    pub fn new(client: Arc<C>, secret_key: SecretKey) -> Self {
+    pub fn new(client: C, secret_key: SecretKey) -> Self {
         Self::builder(secret_key).build(client)
     }
 
@@ -103,7 +102,7 @@ impl<C> NetworkConfig<C> {
 
 impl<C> NetworkConfig<C>
 where
-    C: BlockProvider + HeaderProvider + 'static,
+    C: BlockProvider + HeaderProvider + Clone + Unpin + 'static,
 {
     /// Starts the networking stack given a [NetworkConfig] and returns a handle to the network.
     pub async fn start_network(self) -> Result<NetworkHandle, NetworkError> {
@@ -140,12 +139,12 @@ pub struct NetworkConfigBuilder {
     /// How to configure the sessions manager
     sessions_config: Option<SessionsConfig>,
     /// The network's chain spec
-    chain_spec: ChainSpec,
+    chain_spec: Arc<ChainSpec>,
     /// The default mode of the network.
     network_mode: NetworkMode,
     /// The executor to use for spawning tasks.
     #[serde(skip)]
-    executor: Option<TaskExecutor>,
+    executor: Option<Box<dyn TaskSpawner>>,
     /// Sets the hello message for the p2p handshake in RLPx
     hello_message: Option<HelloMessage>,
     /// Head used to start set for the fork filter and status.
@@ -166,7 +165,7 @@ impl NetworkConfigBuilder {
             listener_addr: None,
             peers_config: None,
             sessions_config: None,
-            chain_spec: MAINNET.clone(),
+            chain_spec: Arc::new(MAINNET.clone()),
             network_mode: Default::default(),
             executor: None,
             hello_message: None,
@@ -180,7 +179,7 @@ impl NetworkConfigBuilder {
     }
 
     /// Sets the chain spec.
-    pub fn chain_spec(mut self, chain_spec: ChainSpec) -> Self {
+    pub fn chain_spec(mut self, chain_spec: Arc<ChainSpec>) -> Self {
         self.chain_spec = chain_spec;
         self
     }
@@ -221,8 +220,8 @@ impl NetworkConfigBuilder {
     /// Sets the executor to use for spawning tasks.
     ///
     /// If `None`, then [tokio::spawn] is used for spawning tasks.
-    pub fn executor(mut self, executor: Option<TaskExecutor>) -> Self {
-        self.executor = executor;
+    pub fn with_task_executor(mut self, executor: Box<dyn TaskSpawner>) -> Self {
+        self.executor = Some(executor);
         self
     }
 
@@ -232,9 +231,31 @@ impl NetworkConfigBuilder {
         self
     }
 
-    /// Sets the socket address the network will listen on
+    /// Sets the discovery and listener address
+    ///
+    /// This is a convenience function for both [NetworkConfigBuilder::listener_addr] and
+    /// [NetworkConfigBuilder::discovery_addr].
+    ///
+    /// By default, both are on the same port: [DEFAULT_DISCOVERY_PORT]
+    pub fn set_addrs(self, addr: SocketAddr) -> Self {
+        self.listener_addr(addr).discovery_addr(addr)
+    }
+
+    /// Sets the socket address the network will listen on.
+    ///
+    /// By default, this is [Ipv4Addr::UNSPECIFIED] on [DEFAULT_DISCOVERY_PORT]
     pub fn listener_addr(mut self, listener_addr: SocketAddr) -> Self {
         self.listener_addr = Some(listener_addr);
+        self
+    }
+
+    /// Sets the port of the address the network will listen on.
+    ///
+    /// By default, this is [DEFAULT_DISCOVERY_PORT]
+    pub fn listener_port(mut self, port: u16) -> Self {
+        self.listener_addr
+            .get_or_insert(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, DEFAULT_DISCOVERY_PORT).into())
+            .set_port(port);
         self
     }
 
@@ -250,21 +271,9 @@ impl NetworkConfigBuilder {
         self
     }
 
-    /// Disables Discv4 discovery.
-    pub fn no_discv4_discovery(mut self) -> Self {
-        self.discovery_v4_builder = None;
-        self
-    }
-
     /// Sets the dns discovery config to use.
     pub fn dns_discovery(mut self, config: DnsDiscoveryConfig) -> Self {
         self.dns_discovery_config = Some(config);
-        self
-    }
-
-    /// Disables DNS discovery
-    pub fn no_dns_discovery(mut self) -> Self {
-        self.dns_discovery_config = None;
         self
     }
 
@@ -274,24 +283,53 @@ impl NetworkConfigBuilder {
         self
     }
 
-    /// Sets the discovery service off on true.
-    // TODO(onbjerg): This name does not imply `true` = disable
-    pub fn set_discovery(mut self, disable_discovery: bool) -> Self {
-        if disable_discovery {
-            self.disable_discovery();
-        }
+    /// Disable the DNS discovery.
+    pub fn disable_dns_discovery(mut self) -> Self {
+        self.dns_discovery_config = None;
         self
     }
 
-    /// Disables all discovery services.
-    pub fn disable_discovery(&mut self) {
+    /// Disables all discovery.
+    pub fn disable_discovery(self) -> Self {
+        self.disable_discv4_discovery().disable_dns_discovery()
+    }
+
+    /// Disables all discovery if the given condition is true.
+    pub fn disable_discovery_if(self, disable: bool) -> Self {
+        if disable {
+            self.disable_discovery()
+        } else {
+            self
+        }
+    }
+
+    /// Disable the Discv4 discovery.
+    pub fn disable_discv4_discovery(mut self) -> Self {
         self.discovery_v4_builder = None;
-        self.dns_discovery_config = None;
+        self
+    }
+
+    /// Disable the DNS discovery if the given condition is true.
+    pub fn disable_dns_discovery_if(self, disable: bool) -> Self {
+        if disable {
+            self.disable_dns_discovery()
+        } else {
+            self
+        }
+    }
+
+    /// Disable the Discv4 discovery if the given condition is true.
+    pub fn disable_discv4_discovery_if(self, disable: bool) -> Self {
+        if disable {
+            self.disable_discv4_discovery()
+        } else {
+            self
+        }
     }
 
     /// Consumes the type and creates the actual [`NetworkConfig`]
     /// for the given client type that can interact with the chain.
-    pub fn build<C>(self, client: Arc<C>) -> NetworkConfig<C> {
+    pub fn build<C>(self, client: C) -> NetworkConfig<C> {
         let peer_id = self.get_peer_id();
         let Self {
             secret_key,
@@ -357,7 +395,7 @@ impl NetworkConfigBuilder {
             chain_spec,
             block_import: Box::<ProofOfStakeBlockImport>::default(),
             network_mode,
-            executor,
+            executor: executor.unwrap_or_else(|| Box::<TokioTaskExecutor>::default()),
             status,
             hello_message,
             fork_filter,
@@ -405,7 +443,7 @@ mod tests {
 
     #[test]
     fn test_network_dns_defaults() {
-        let config = builder().build(Arc::new(NoopProvider::default()));
+        let config = builder().build(NoopProvider::default());
 
         let dns = config.dns_discovery_config.unwrap();
         let bootstrap_nodes = dns.bootstrap_dns_networks.unwrap();
@@ -421,12 +459,13 @@ mod tests {
 
         // remove any `next` fields we would have by removing all hardforks
         chain_spec.hardforks = BTreeMap::new();
+        let chain_spec = Arc::new(chain_spec);
 
         // check that the forkid is initialized with the genesis and no other forks
         let genesis_fork_hash = ForkHash::from(chain_spec.genesis_hash());
 
         // enforce that the fork_id set in the status is consistent with the generated fork filter
-        let config = builder().chain_spec(chain_spec).build(Arc::new(NoopProvider::default()));
+        let config = builder().chain_spec(chain_spec).build(NoopProvider::default());
 
         let status = config.status;
         let fork_filter = config.fork_filter;

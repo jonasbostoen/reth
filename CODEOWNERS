@@ -6,3 +6,5 @@ crates/executor/            @rakita
 crates/stages/              @onbjerg @rkrasiuk
 crates/storage/             @rakita @joshieDo
 crates/transaction-pool/    @mattsse
+crates/rpc/                 @mattsse @Rjected
+crates/payload/             @mattsse @Rjected

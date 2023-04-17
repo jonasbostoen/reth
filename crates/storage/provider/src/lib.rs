@@ -1,4 +1,4 @@
-#![warn(missing_docs, unreachable_pub)]
+#![warn(missing_docs, unreachable_pub, unused_crate_dependencies)]
 #![deny(unused_must_use, rust_2018_idioms)]
 #![doc(test(
     no_crate_inject,
@@ -11,8 +11,11 @@
 /// Various provider traits.
 mod traits;
 pub use traits::{
-    AccountProvider, BlockHashProvider, BlockProvider, HeaderProvider, StateProvider,
-    StateProviderFactory,
+    AccountProvider, BlockExecutor, BlockHashProvider, BlockIdProvider, BlockProvider,
+    BlockchainTreePendingStateProvider, CanonStateNotification, CanonStateNotificationSender,
+    CanonStateNotifications, CanonStateSubscriptions, EvmEnvProvider, ExecutorFactory,
+    HeaderProvider, PostStateDataProvider, ReceiptProvider, StateProvider, StateProviderBox,
+    StateProviderFactory, TransactionsProvider, WithdrawalsProvider,
 };
 
 /// Provider trait implementations.
@@ -21,6 +24,10 @@ pub use providers::{
     HistoricalStateProvider, HistoricalStateProviderRef, LatestStateProvider,
     LatestStateProviderRef, ShareableDatabase,
 };
+
+/// Execution result
+pub mod post_state;
+pub use post_state::PostState;
 
 /// Helper types for interacting with the database
 mod transaction;
@@ -35,4 +42,7 @@ pub use utils::{insert_block, insert_canonical_block};
 pub mod test_utils;
 
 /// Re-export provider error.
-pub use reth_interfaces::provider::Error;
+pub use reth_interfaces::provider::ProviderError;
+
+pub mod chain;
+pub use chain::Chain;

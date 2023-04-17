@@ -1,7 +1,7 @@
 //! Transaction Pool internals.
 //!
-//! Incoming transactions are before they enter the pool first. The validation outcome can have 3
-//! states:
+//! Incoming transactions validated are before they enter the pool first. The validation outcome can
+//! have 3 states:
 //!
 //!  1. Transaction can _never_ be valid
 //!  2. Transaction is _currently_ valid
@@ -92,7 +92,6 @@ mod parked;
 pub(crate) mod pending;
 pub(crate) mod size;
 pub(crate) mod state;
-mod transaction;
 pub mod txpool;
 mod update;
 
@@ -101,7 +100,7 @@ pub struct PoolInner<V: TransactionValidator, T: TransactionOrdering> {
     /// Internal mapping of addresses to plain ints.
     identifiers: RwLock<SenderIdentifiers>,
     /// Transaction validation.
-    validator: Arc<V>,
+    validator: V,
     /// The internal pool that manages all transactions.
     pool: RwLock<TxPool<T>>,
     /// Pool settings.
@@ -116,13 +115,13 @@ pub struct PoolInner<V: TransactionValidator, T: TransactionOrdering> {
 
 // === impl PoolInner ===
 
-impl<V: TransactionValidator, T: TransactionOrdering> PoolInner<V, T>
+impl<V, T> PoolInner<V, T>
 where
     V: TransactionValidator,
     T: TransactionOrdering<Transaction = <V as TransactionValidator>::Transaction>,
 {
     /// Create a new transaction pool instance.
-    pub(crate) fn new(validator: Arc<V>, ordering: Arc<T>, config: PoolConfig) -> Self {
+    pub(crate) fn new(validator: V, ordering: T, config: PoolConfig) -> Self {
         Self {
             identifiers: Default::default(),
             validator,
@@ -172,9 +171,15 @@ where
     }
 
     /// Returns hashes of _all_ transactions in the pool.
-    pub(crate) fn pooled_transactions(&self) -> Vec<TxHash> {
+    pub(crate) fn pooled_transactions_hashes(&self) -> Vec<TxHash> {
         let pool = self.pool.read();
         pool.all().hashes_iter().collect()
+    }
+
+    /// Returns _all_ transactions in the pool.
+    pub(crate) fn pooled_transactions(&self) -> Vec<Arc<ValidPoolTransaction<T::Transaction>>> {
+        let pool = self.pool.read();
+        pool.all().transactions_iter().collect()
     }
 
     /// Updates the entire pool after a new block was executed.
@@ -196,6 +201,7 @@ where
             TransactionValidationOutcome::Valid { balance, state_nonce, transaction } => {
                 let sender_id = self.get_sender_id(transaction.sender());
                 let transaction_id = TransactionId::new(sender_id, transaction.nonce());
+                let encoded_length = transaction.encoded_length();
 
                 let tx = ValidPoolTransaction {
                     cost: transaction.cost(),
@@ -204,6 +210,7 @@ where
                     propagate: false,
                     timestamp: Instant::now(),
                     origin,
+                    encoded_length,
                 };
 
                 let added = self.pool.write().add_transaction(tx, balance, state_nonce)?;
@@ -225,7 +232,12 @@ where
             TransactionValidationOutcome::Invalid(tx, err) => {
                 let mut listener = self.event_listener.write();
                 listener.discarded(tx.hash());
-                Err(err)
+                Err(PoolError::InvalidTransaction(*tx.hash(), err))
+            }
+            TransactionValidationOutcome::Error(tx, err) => {
+                let mut listener = self.event_listener.write();
+                listener.discarded(tx.hash());
+                Err(PoolError::Other(*tx.hash(), err))
             }
         }
     }
@@ -335,11 +347,11 @@ where
     }
 
     /// Removes and returns all matching transactions from the pool.
-    pub(crate) fn remove_invalid(
+    pub(crate) fn remove_transactions(
         &self,
         hashes: impl IntoIterator<Item = TxHash>,
     ) -> Vec<Arc<ValidPoolTransaction<T::Transaction>>> {
-        let removed = self.pool.write().remove_invalid(hashes);
+        let removed = self.pool.write().remove_transactions(hashes);
 
         let mut listener = self.event_listener.write();
 
@@ -360,6 +372,15 @@ where
         tx_hash: &TxHash,
     ) -> Option<Arc<ValidPoolTransaction<T::Transaction>>> {
         self.pool.read().get(tx_hash)
+    }
+
+    /// Returns all transactions of the address
+    pub(crate) fn get_transactions_by_sender(
+        &self,
+        sender: Address,
+    ) -> Vec<Arc<ValidPoolTransaction<T::Transaction>>> {
+        let sender_id = self.get_sender_id(sender);
+        self.pool.read().get_transactions_by_sender(sender_id)
     }
 
     /// Returns all the transactions belonging to the hashes.
@@ -410,19 +431,12 @@ pub struct AddedPendingTransaction<T: PoolTransaction> {
     promoted: Vec<TxHash>,
     /// transaction that failed and became discarded
     discarded: Vec<TxHash>,
-    /// Transactions removed from the Ready pool
-    removed: Vec<Arc<ValidPoolTransaction<T>>>,
 }
 
 impl<T: PoolTransaction> AddedPendingTransaction<T> {
     /// Create a new, empty transaction.
     fn new(transaction: Arc<ValidPoolTransaction<T>>) -> Self {
-        Self {
-            transaction,
-            promoted: Default::default(),
-            discarded: Default::default(),
-            removed: Default::default(),
-        }
+        Self { transaction, promoted: Default::default(), discarded: Default::default() }
     }
 }
 

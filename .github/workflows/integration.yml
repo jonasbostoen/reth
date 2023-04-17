@@ -16,9 +16,11 @@ concurrency:
 name: integration
 jobs:
   test:
-    # Pin to `20.04` instead of `ubuntu-latest`, until ubuntu-latest migration is complete
-    # See also <https://github.com/foundry-rs/foundry/issues/3827>
-    runs-on: ubuntu-20.04
+    name: test (partition ${{ matrix.partition }}/${{ strategy.job-total }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        partition: [1, 2]
     steps:
       - name: Checkout sources
         uses: actions/checkout@v3
@@ -50,6 +52,7 @@ jobs:
         run: |
           cargo llvm-cov nextest --lcov --output-path lcov.info \
             --locked --workspace --all-features \
+            --partition hash:${{ matrix.partition }}/${{ strategy.job-total }} \
             -E 'kind(test)'
 
       - name: Upload coverage data to codecov
@@ -86,4 +89,5 @@ jobs:
           cargo run --profile ${{ matrix.profile }} \
             --bin reth -- node \
             --debug.tip 0x91c90676cab257a59cd956d7cb0bceb9b1a71d79755c23c7277a0697ccfaf8c4 \
-            --debug.max-block 100000
+            --debug.max-block 100000 \
+            --debug.terminate

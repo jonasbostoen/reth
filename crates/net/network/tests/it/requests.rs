@@ -1,7 +1,6 @@
 //! Tests for eth related requests
 
 use rand::Rng;
-use reth_eth_wire::BlockBody;
 use reth_interfaces::p2p::{
     bodies::client::BodiesClient,
     headers::client::{HeadersClient, HeadersRequest},
@@ -9,7 +8,7 @@ use reth_interfaces::p2p::{
 use reth_network::test_utils::{NetworkEventStream, Testnet};
 use reth_network_api::{NetworkInfo, Peers};
 use reth_primitives::{
-    Block, Bytes, Header, HeadersDirection, Signature, Transaction, TransactionKind,
+    Block, BlockBody, Bytes, Header, HeadersDirection, Signature, Transaction, TransactionKind,
     TransactionSigned, TxEip2930, H256, U256,
 };
 use reth_provider::test_utils::MockEthProvider;
@@ -70,7 +69,8 @@ async fn test_get_body() {
 
         let blocks = res.unwrap().1;
         assert_eq!(blocks.len(), 1);
-        let expected = BlockBody { transactions: block.body, ommers: block.ommers };
+        let expected =
+            BlockBody { transactions: block.body, ommers: block.ommers, withdrawals: None };
         assert_eq!(blocks[0], expected);
     }
 }

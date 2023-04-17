@@ -3,6 +3,7 @@
 use criterion::{
     black_box, criterion_group, criterion_main, measurement::WallTime, BenchmarkGroup, Criterion,
 };
+use pprof::criterion::{Output, PProfProfiler};
 use proptest::{
     arbitrary::Arbitrary,
     prelude::{any_with, ProptestConfig},
@@ -10,13 +11,18 @@ use proptest::{
     test_runner::TestRunner,
 };
 use reth_db::{
-    cursor::{DbDupCursorRO, DbDupCursorRW},
+    cursor::{DbCursorRW, DbDupCursorRO, DbDupCursorRW},
     mdbx::Env,
+    TxHashNumber,
 };
 use std::{collections::HashSet, time::Instant};
 use test_fuzz::runtime::num_traits::Zero;
 
-criterion_group!(benches, hash_keys);
+criterion_group! {
+    name = benches;
+    config = Criterion::default().with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
+    targets = hash_keys
+}
 criterion_main!(benches);
 
 /// It benchmarks the insertion of rows into a table where `Keys` are hashes.
@@ -33,7 +39,7 @@ pub fn hash_keys(c: &mut Criterion) {
 
     group.sample_size(10);
 
-    for size in vec![10_000, 100_000, 1_000_000] {
+    for size in [10_000, 100_000, 1_000_000] {
         measure_table_insertion::<TxHashNumber>(&mut group, size);
     }
 }
@@ -128,6 +134,7 @@ where
 
 /// Generates two batches. The first is to be inserted into the database before running the
 /// benchmark. The second is to be benchmarked with.
+#[allow(clippy::type_complexity)]
 fn generate_batches<T>(size: usize) -> (Vec<(T::Key, T::Value)>, Vec<(T::Key, T::Value)>)
 where
     T: Table + Default,
@@ -170,7 +177,7 @@ where
                 crsr.append(k, v).expect("submit");
             }
 
-            tx.inner.commit().unwrap();
+            tx.inner.commit().unwrap()
         });
     }
     db
@@ -191,7 +198,7 @@ where
                 crsr.insert(k, v).expect("submit");
             }
 
-            tx.inner.commit().unwrap();
+            tx.inner.commit().unwrap()
         });
     }
     db
@@ -208,7 +215,7 @@ where
                 tx.put::<T>(k, v).expect("submit");
             }
 
-            tx.inner.commit().unwrap();
+            tx.inner.commit().unwrap()
         });
     }
     db

@@ -3,6 +3,7 @@
 use std::{borrow::Cow, collections::Bound, marker::PhantomData, ops::RangeBounds};
 
 use crate::{
+    common::{PairResult, ValueOnlyResult},
     cursor::{
         DbCursorRO, DbCursorRW, DbDupCursorRO, DbDupCursorRW, DupWalker, RangeWalker,
         ReverseWalker, Walker,
@@ -12,13 +13,6 @@ use crate::{
     Error,
 };
 use reth_libmdbx::{self, Error as MDBXError, TransactionKind, WriteFlags, RO, RW};
-
-/// Alias type for a `(key, value)` result coming from a cursor.
-pub type PairResult<T> = Result<Option<(<T as Table>::Key, <T as Table>::Value)>, Error>;
-/// Alias type for a `(key, value)` result coming from an iterator.
-pub type IterPairResult<T> = Option<Result<(<T as Table>::Key, <T as Table>::Value), Error>>;
-/// Alias type for a value result coming from a cursor without its key.
-pub type ValueOnlyResult<T> = Result<Option<<T as Table>::Value>, Error>;
 
 /// Read only Cursor.
 pub type CursorRO<'tx, T> = Cursor<'tx, RO, T>;
@@ -34,6 +28,8 @@ pub struct Cursor<'tx, K: TransactionKind, T: Table> {
     pub table: &'static str,
     /// Phantom data to enforce encoding/decoding.
     pub _dbi: std::marker::PhantomData<T>,
+    /// Cache buffer that receives compressed values.
+    pub buf: Vec<u8>,
 }
 
 /// Takes `(key, value)` from the database and decodes it appropriately.
@@ -41,6 +37,20 @@ pub struct Cursor<'tx, K: TransactionKind, T: Table> {
 macro_rules! decode {
     ($v:expr) => {
         $v.map_err(|e| Error::Read(e.into()))?.map(decoder::<T>).transpose()
+    };
+}
+
+/// Some types don't support compression (eg. H256), and we don't want to be copying them to the
+/// allocated buffer when we can just use their reference.
+macro_rules! compress_or_ref {
+    ($self:expr, $value:expr) => {
+        if let Some(value) = $value.uncompressable_ref() {
+            value
+        } else {
+            $self.buf.truncate(0);
+            $value.compress_to_buf(&mut $self.buf);
+            $self.buf.as_ref()
+        }
     };
 }
 
@@ -101,19 +111,15 @@ impl<'tx, K: TransactionKind, T: Table> DbCursorRO<'tx, T> for Cursor<'tx, K, T>
     {
         let start = match range.start_bound().cloned() {
             Bound::Included(key) => self.inner.set_range(key.encode().as_ref()),
-            Bound::Excluded(key) => {
-                self.inner
-                    .set_range(key.encode().as_ref())
-                    .map_err(|e| Error::Read(e.into()))?
-                    .map(decoder::<T>);
-                self.inner.next()
+            Bound::Excluded(_key) => {
+                unreachable!("Rust doesn't allow for Bound::Excluded in starting bounds");
             }
             Bound::Unbounded => self.inner.first(),
         }
         .map_err(|e| Error::Read(e.into()))?
         .map(decoder::<T>);
 
-        Ok(RangeWalker::new(self, start, range.start_bound().cloned(), range.end_bound().cloned()))
+        Ok(RangeWalker::new(self, start, range.end_bound().cloned()))
     }
 
     fn walk_back<'cursor>(
@@ -124,13 +130,11 @@ impl<'tx, K: TransactionKind, T: Table> DbCursorRO<'tx, T> for Cursor<'tx, K, T>
         Self: Sized,
     {
         let start = if let Some(start_key) = start_key {
-            self.inner
-                .set_range(start_key.encode().as_ref())
-                .map_err(|e| Error::Read(e.into()))?
-                .map(decoder::<T>)
+            decode!(self.inner.set_range(start_key.encode().as_ref()))
         } else {
-            self.last().transpose()
-        };
+            self.last()
+        }
+        .transpose();
 
         Ok(ReverseWalker::new(self, start))
     }
@@ -216,16 +220,21 @@ impl<'tx, K: TransactionKind, T: DupSort> DbDupCursorRO<'tx, T> for Cursor<'tx, 
 impl<'tx, T: Table> DbCursorRW<'tx, T> for Cursor<'tx, RW, T> {
     /// Database operation that will update an existing row if a specified value already
     /// exists in a table, and insert a new row if the specified value doesn't already exist
+    ///
+    /// For a DUPSORT table, `upsert` will not actually update-or-insert. If the key already exists,
+    /// it will append the value to the subkey, even if the subkeys are the same. So if you want
+    /// to properly upsert, you'll need to `seek_exact` & `delete_current` if the key+subkey was
+    /// found, before calling `upsert`.
     fn upsert(&mut self, key: T::Key, value: T::Value) -> Result<(), Error> {
         // Default `WriteFlags` is UPSERT
         self.inner
-            .put(key.encode().as_ref(), value.compress().as_ref(), WriteFlags::UPSERT)
+            .put(key.encode().as_ref(), compress_or_ref!(self, value), WriteFlags::UPSERT)
             .map_err(|e| Error::Write(e.into()))
     }
 
     fn insert(&mut self, key: T::Key, value: T::Value) -> Result<(), Error> {
         self.inner
-            .put(key.encode().as_ref(), value.compress().as_ref(), WriteFlags::NO_OVERWRITE)
+            .put(key.encode().as_ref(), compress_or_ref!(self, value), WriteFlags::NO_OVERWRITE)
             .map_err(|e| Error::Write(e.into()))
     }
 
@@ -233,7 +242,7 @@ impl<'tx, T: Table> DbCursorRW<'tx, T> for Cursor<'tx, RW, T> {
     /// will fail if the inserted key is less than the last table key
     fn append(&mut self, key: T::Key, value: T::Value) -> Result<(), Error> {
         self.inner
-            .put(key.encode().as_ref(), value.compress().as_ref(), WriteFlags::APPEND)
+            .put(key.encode().as_ref(), compress_or_ref!(self, value), WriteFlags::APPEND)
             .map_err(|e| Error::Write(e.into()))
     }
 
@@ -249,7 +258,7 @@ impl<'tx, T: DupSort> DbDupCursorRW<'tx, T> for Cursor<'tx, RW, T> {
 
     fn append_dup(&mut self, key: T::Key, value: T::Value) -> Result<(), Error> {
         self.inner
-            .put(key.encode().as_ref(), value.compress().as_ref(), WriteFlags::APPEND_DUP)
+            .put(key.encode().as_ref(), compress_or_ref!(self, value), WriteFlags::APPEND_DUP)
             .map_err(|e| Error::Write(e.into()))
     }
 }

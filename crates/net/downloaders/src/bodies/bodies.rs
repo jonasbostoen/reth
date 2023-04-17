@@ -144,7 +144,7 @@ where
             }
 
             // Add header to the result collection
-            headers.push(SealedHeader::new(header, hash));
+            headers.push(header.seal(hash));
 
             // Increment current block number
             current_block_num += 1;
@@ -207,6 +207,9 @@ where
         self.in_progress_queue.clear();
         self.buffered_responses.clear();
         self.queued_bodies.clear();
+
+        self.metrics.in_flight_requests.set(0.);
+        self.metrics.buffered_responses.set(0.);
     }
 
     /// Queues bodies and sets the latest queued block number
@@ -223,6 +226,7 @@ where
 
             if next_block_rng.contains(&expected) {
                 return self.buffered_responses.pop().map(|buffered| {
+                    self.metrics.buffered_responses.decrement(1.);
                     buffered
                         .0
                         .into_iter()
@@ -234,6 +238,7 @@ where
 
             // Drop buffered response since we passed that range
             if *next_block_rng.end() < expected {
+                self.metrics.buffered_responses.decrement(1.);
                 self.buffered_responses.pop();
             }
         }
@@ -275,28 +280,35 @@ where
     /// downloaded or are not in progress, they will be re-requested.
     fn set_download_range(&mut self, range: Range<BlockNumber>) -> DownloadResult<()> {
         // Check if the range is valid.
-        let is_valid = !range.is_empty();
-        if is_valid {
-            // Check if the provided range is the subset of the existing range.
-            let is_current_range_subset =
-                self.download_range.contains(&range.start) && range.end == self.download_range.end;
-            if is_current_range_subset {
-                tracing::trace!(target: "downloaders::bodies", ?range, "Download range already in progress");
-                // The current range already includes requested.
-                return Ok(())
-            }
-
-            // Check if the provided range is the next expected range.
-            let is_next_range = range.start >= self.download_range.end;
-            if is_next_range {
-                // New range received.
-                tracing::trace!(target: "downloaders::bodies", ?range, "New download range set");
-                self.download_range = range;
-                return Ok(())
-            }
+        if range.is_empty() {
+            tracing::error!(target: "downloaders::bodies", ?range, "Range is invalid");
+            return Err(DownloadError::InvalidBodyRange { range })
         }
 
-        Err(DownloadError::InvalidBodyRange { range })
+        // Check if the provided range is the subset of the existing range.
+        let is_current_range_subset =
+            self.download_range.contains(&range.start) && range.end == self.download_range.end;
+        if is_current_range_subset {
+            tracing::trace!(target: "downloaders::bodies", ?range, "Download range already in progress");
+            // The current range already includes requested.
+            return Ok(())
+        }
+
+        // Check if the provided range is the next expected range.
+        let is_next_consecutive_range = range.start == self.download_range.end;
+        if is_next_consecutive_range {
+            // New range received.
+            tracing::trace!(target: "downloaders::bodies", ?range, "New download range set");
+            self.download_range = range;
+            return Ok(())
+        }
+
+        // The block range is reset. This can happen either after unwind or after the bodies were
+        // written by external services (e.g. BlockchainTree).
+        tracing::trace!(target: "downloaders::bodies", ?range, prev_range = ?self.download_range, "Download range reset");
+        self.clear();
+        self.download_range = range;
+        Ok(())
     }
 }
 
@@ -318,8 +330,19 @@ where
         loop {
             // Poll requests
             while let Poll::Ready(Some(response)) = this.in_progress_queue.poll_next_unpin(cx) {
-                let response = OrderedBodiesResponse(response);
-                this.buffered_responses.push(response);
+                this.metrics.in_flight_requests.decrement(1.);
+                match response {
+                    Ok(response) => {
+                        let response = OrderedBodiesResponse(response);
+                        this.buffered_responses.push(response);
+                        this.metrics.buffered_responses.increment(1.);
+                    }
+                    Err(error) => {
+                        tracing::error!(target: "downloaders::bodies", ?error, "Request failed");
+                        this.clear();
+                        return Poll::Ready(Some(Err(error)))
+                    }
+                };
             }
 
             // Loop exit condition
@@ -331,6 +354,7 @@ where
             {
                 match this.next_headers_request() {
                     Ok(Some(request)) => {
+                        this.metrics.in_flight_requests.increment(1.);
                         this.in_progress_queue.push_new_request(
                             Arc::clone(&this.client),
                             Arc::clone(&this.consensus),
@@ -475,7 +499,7 @@ impl BodiesDownloaderBuilder {
     /// Consume self and return the concurrent donwloader.
     pub fn build<B, DB>(
         self,
-        client: Arc<B>,
+        client: B,
         consensus: Arc<dyn Consensus>,
         db: Arc<DB>,
     ) -> BodiesDownloader<B, DB>
@@ -492,7 +516,7 @@ impl BodiesDownloaderBuilder {
         let metrics = DownloaderMetrics::new(BODIES_DOWNLOADER_SCOPE);
         let in_progress_queue = BodiesRequestQueue::new(metrics.clone());
         BodiesDownloader {
-            client,
+            client: Arc::new(client),
             consensus,
             db,
             request_limit,
@@ -519,9 +543,8 @@ mod tests {
     use assert_matches::assert_matches;
     use futures_util::stream::StreamExt;
     use reth_db::mdbx::{test_utils::create_test_db, EnvKind, WriteMap};
-    use reth_eth_wire::BlockBody;
     use reth_interfaces::test_utils::{generators::random_block_range, TestConsensus};
-    use reth_primitives::H256;
+    use reth_primitives::{BlockBody, H256};
     use std::{collections::HashMap, sync::Arc};
 
     // Check that the blocks are emitted in order of block number, not in order of
@@ -568,6 +591,7 @@ mod tests {
                     BlockBody {
                         transactions: block.body,
                         ommers: block.ommers.into_iter().map(|header| header.unseal()).collect(),
+                        withdrawals: None,
                     },
                 )
             })

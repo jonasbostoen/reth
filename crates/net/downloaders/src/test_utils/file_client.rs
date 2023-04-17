@@ -1,6 +1,5 @@
 use super::file_codec::BlockFileCodec;
 use itertools::Either;
-use reth_eth_wire::BlockBody;
 use reth_interfaces::{
     p2p::{
         bodies::client::{BodiesClient, BodiesFut},
@@ -12,7 +11,8 @@ use reth_interfaces::{
     sync::{SyncState, SyncStateProvider, SyncStateUpdater},
 };
 use reth_primitives::{
-    Block, BlockHash, BlockHashOrNumber, BlockNumber, Header, HeadersDirection, PeerId, H256,
+    Block, BlockBody, BlockHash, BlockHashOrNumber, BlockNumber, Header, HeadersDirection, PeerId,
+    H256,
 };
 use reth_rlp::{Decodable, Header as RlpHeader};
 use std::{
@@ -102,7 +102,14 @@ impl FileClient {
             // add to the internal maps
             headers.insert(block.header.number, block.header.clone());
             hash_to_number.insert(block_hash, block.header.number);
-            bodies.insert(block_hash, BlockBody { transactions: block.body, ommers: block.ommers });
+            bodies.insert(
+                block_hash,
+                BlockBody {
+                    transactions: block.body,
+                    ommers: block.ommers,
+                    withdrawals: block.withdrawals,
+                },
+            );
         }
 
         trace!(blocks = headers.len(), "Initialized file client");
@@ -112,7 +119,7 @@ impl FileClient {
 
     /// Get the tip hash of the chain.
     pub fn tip(&self) -> Option<H256> {
-        self.headers.get(&(self.headers.len() as u64 - 1)).map(|h| h.hash_slow())
+        self.headers.get(&(self.headers.len() as u64)).map(|h| h.hash_slow())
     }
 
     /// Use the provided bodies as the file client's block body buffer.

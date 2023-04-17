@@ -2,7 +2,7 @@
 
 use crate::{
     identifier::{SenderIdentifiers, TransactionId},
-    pool::txpool::{TxPool, MIN_PROTOCOL_BASE_FEE},
+    pool::txpool::TxPool,
     traits::TransactionOrigin,
     PoolTransaction, TransactionOrdering, ValidPoolTransaction,
 };
@@ -12,8 +12,9 @@ use rand::{
     prelude::Distribution,
 };
 use reth_primitives::{
-    Address, FromRecoveredTransaction, IntoRecoveredTransaction, Transaction, TransactionKind,
-    TransactionSignedEcRecovered, TxEip1559, TxHash, TxLegacy, H256, U128, U256,
+    constants::MIN_PROTOCOL_BASE_FEE, hex, Address, FromRecoveredTransaction,
+    IntoRecoveredTransaction, Signature, Transaction, TransactionKind, TransactionSigned,
+    TransactionSignedEcRecovered, TxEip1559, TxHash, TxLegacy, TxType, H256, U128, U256,
 };
 use std::{ops::Range, sync::Arc, time::Instant};
 
@@ -23,7 +24,7 @@ pub type MockValidTx = ValidPoolTransaction<MockTransaction>;
 
 /// Create an empty `TxPool`
 pub(crate) fn mock_tx_pool() -> MockTxPool {
-    MockTxPool::new(Arc::new(Default::default()), Default::default())
+    MockTxPool::new(Default::default(), Default::default())
 }
 
 /// Sets the value for the field
@@ -345,6 +346,21 @@ impl PoolTransaction for MockTransaction {
     fn size(&self) -> usize {
         0
     }
+
+    fn tx_type(&self) -> u8 {
+        match self {
+            MockTransaction::Legacy { .. } => TxType::Legacy.into(),
+            MockTransaction::Eip1559 { .. } => TxType::EIP1559.into(),
+        }
+    }
+
+    fn encoded_length(&self) -> usize {
+        0
+    }
+
+    fn chain_id(&self) -> Option<u64> {
+        Some(1)
+    }
 }
 
 impl FromRecoveredTransaction for MockTransaction {
@@ -399,7 +415,25 @@ impl FromRecoveredTransaction for MockTransaction {
 
 impl IntoRecoveredTransaction for MockTransaction {
     fn to_recovered_transaction(&self) -> TransactionSignedEcRecovered {
-        todo!()
+        let tx = Transaction::Legacy(TxLegacy {
+            chain_id: self.chain_id(),
+            nonce: self.get_nonce(),
+            gas_price: self.get_gas_price(),
+            gas_limit: self.get_gas_limit(),
+            to: TransactionKind::Call(Address::from_slice(
+                &hex::decode("d3e8763675e4c425df46cc3b5c0f6cbdac396046").unwrap()[..],
+            )),
+            value: 693361000000000u64.into(),
+            input: Default::default(),
+        });
+
+        let signed_tx = TransactionSigned {
+            hash: *self.hash(),
+            signature: Signature::default(),
+            transaction: tx,
+        };
+
+        TransactionSignedEcRecovered::from_signed_transaction(signed_tx, self.sender())
     }
 }
 
@@ -427,6 +461,7 @@ impl MockTransactionFactory {
         transaction: MockTransaction,
     ) -> MockValidTx {
         let transaction_id = self.tx_id(&transaction);
+        let encoded_length = transaction.encoded_length();
         MockValidTx {
             propagate: false,
             transaction_id,
@@ -434,6 +469,7 @@ impl MockTransactionFactory {
             transaction,
             timestamp: Instant::now(),
             origin,
+            encoded_length,
         }
     }
 

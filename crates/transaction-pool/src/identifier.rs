@@ -5,6 +5,7 @@ use std::collections::HashMap;
 /// An internal mapping of addresses.
 ///
 /// This assigns a _unique_ `SenderId` for a new `Address`.
+/// It has capacity for 2^64 unique addresses.
 #[derive(Debug, Default)]
 pub(crate) struct SenderIdentifiers {
     /// The identifier to use next.
@@ -57,7 +58,6 @@ pub struct SenderId(u64);
 
 impl SenderId {
     /// Returns a `Bound` for `TransactionId` starting with nonce `0`
-    #[cfg(test)]
     pub(crate) fn start_bound(self) -> std::ops::Bound<TransactionId> {
         std::ops::Bound::Included(TransactionId::new(self, 0))
     }
@@ -102,20 +102,12 @@ impl TransactionId {
             return None
         }
         let prev_nonce = transaction_nonce.saturating_sub(1);
-        if on_chain_nonce <= prev_nonce {
-            Some(Self::new(sender, prev_nonce))
-        } else {
-            None
-        }
+        (on_chain_nonce <= prev_nonce).then(|| Self::new(sender, prev_nonce))
     }
 
     /// Returns the `TransactionId` that would come before this transaction.
     pub(crate) fn unchecked_ancestor(&self) -> Option<TransactionId> {
-        if self.nonce == 0 {
-            None
-        } else {
-            Some(TransactionId::new(self.sender, self.nonce - 1))
-        }
+        (self.nonce != 0).then(|| TransactionId::new(self.sender, self.nonce - 1))
     }
 
     /// Returns the `TransactionId` that directly follows this transaction: `self.nonce + 1`

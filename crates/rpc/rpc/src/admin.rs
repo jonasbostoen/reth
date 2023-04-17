@@ -1,4 +1,4 @@
-use crate::result::ToRpcResult;
+use crate::result::{internal_rpc_err, ToRpcResult};
 use async_trait::async_trait;
 use jsonrpsee::core::RpcResult;
 use reth_network_api::{NetworkInfo, PeerKind, Peers};
@@ -26,33 +26,40 @@ impl<N> AdminApiServer for AdminApi<N>
 where
     N: NetworkInfo + Peers + 'static,
 {
+    /// Handler for `admin_addPeer`
     fn add_peer(&self, record: NodeRecord) -> RpcResult<bool> {
         self.network.add_peer(record.id, record.tcp_addr());
         Ok(true)
     }
 
+    /// Handler for `admin_removePeer`
     fn remove_peer(&self, record: NodeRecord) -> RpcResult<bool> {
         self.network.remove_peer(record.id, PeerKind::Basic);
         Ok(true)
     }
 
+    /// Handler for `admin_addTrustedPeer`
     fn add_trusted_peer(&self, record: NodeRecord) -> RpcResult<bool> {
         self.network.add_trusted_peer(record.id, record.tcp_addr());
         Ok(true)
     }
 
+    /// Handler for `admin_removeTrustedPeer`
     fn remove_trusted_peer(&self, record: NodeRecord) -> RpcResult<bool> {
         self.network.remove_peer(record.id, PeerKind::Trusted);
         Ok(true)
     }
 
+    /// Handler for `admin_peerEvents`
     fn subscribe_peer_events(
         &self,
-        _subscription_sink: jsonrpsee::SubscriptionSink,
+        sink: jsonrpsee::SubscriptionSink,
     ) -> jsonrpsee::types::SubscriptionResult {
-        todo!()
+        sink.close(internal_rpc_err("admin_peerEvents is not implemented yet"));
+        Ok(())
     }
 
+    /// Handler for `admin_nodeInfo`
     async fn node_info(&self) -> RpcResult<NodeInfo> {
         let enr = self.network.local_node_record();
         let status = self.network.network_status().await.to_rpc_result()?;

@@ -6,7 +6,7 @@ use reth_rlp::{Decodable, DecodeError, Encodable};
 /// transaction and used to determine the sender of
 /// the transaction; formally Tr and Ts. This is expanded in Appendix F of yellow paper.
 #[main_codec]
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Default)]
 pub struct Signature {
     /// The R field of the signature; the point on the curve.
     pub r: U256,
@@ -47,7 +47,7 @@ impl Signature {
     }
 
     /// Decodes the `v`, `r`, `s` values without a RLP header.
-    /// This will return a chain ID if the `v` value is EIP-155 compatible.
+    /// This will return a chain ID if the `v` value is [EIP-155](https://github.com/ethereum/EIPs/blob/master/EIPS/eip-155.md) compatible.
     pub(crate) fn decode_with_eip155_chain_id(
         buf: &mut &[u8],
     ) -> Result<(Self, Option<u64>), DecodeError> {
@@ -60,8 +60,11 @@ impl Signature {
             let chain_id = (v - 35) >> 1;
             Ok((Signature { r, s, odd_y_parity }, Some(chain_id)))
         } else {
-            // non-EIP-155 legacy scheme
-            let odd_y_parity = (v - 27) != 0;
+            // non-EIP-155 legacy scheme, v = 27 for even y-parity, v = 28 for odd y-parity
+            if v != 27 && v != 28 {
+                return Err(DecodeError::Custom("invalid Ethereum signature (V is not 27 or 28)"))
+            }
+            let odd_y_parity = v == 28;
             Ok((Signature { r, s, odd_y_parity }, None))
         }
     }
@@ -98,6 +101,17 @@ impl Signature {
         // NOTE: we are removing error from underlying crypto library as it will restrain primitive
         // errors and we care only if recovery is passing or not.
         secp256k1::recover(&sig, hash.as_fixed_bytes()).ok()
+    }
+
+    /// Turn this signature into its byte
+    /// (hex) representation.
+    pub fn to_bytes(&self) -> [u8; 65] {
+        let mut sig = [0u8; 65];
+        sig[..32].copy_from_slice(&self.r.to_be_bytes::<32>());
+        sig[32..64].copy_from_slice(&self.s.to_be_bytes::<32>());
+        let v = u8::from(self.odd_y_parity) + 27;
+        sig[64] = v;
+        sig
     }
 }
 

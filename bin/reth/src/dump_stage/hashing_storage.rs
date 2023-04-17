@@ -1,7 +1,7 @@
 use crate::{
-    db::DbTool,
     dirs::{DbPath, PlatformPath},
     dump_stage::setup,
+    utils::DbTool,
 };
 use eyre::Result;
 use reth_db::{database::Database, table::TableImporter, tables};
@@ -21,7 +21,6 @@ pub(crate) async fn dump_hashing_storage_stage<DB: Database>(
 
     unwind_and_copy::<DB>(db_tool, from, tip_block_number, &output_db).await?;
 
-    // Try to re-execute the stage without committing
     if should_run {
         dry_run(output_db, to, from).await?;
     }
@@ -56,26 +55,33 @@ async fn unwind_and_copy<DB: Database>(
     Ok(())
 }
 
-/// Try to re-execute the stage without committing
+/// Try to re-execute the stage straightaway
 async fn dry_run(
     output_db: reth_db::mdbx::Env<reth_db::mdbx::WriteMap>,
     to: u64,
     from: u64,
 ) -> eyre::Result<()> {
-    info!(target: "reth::cli", "Executing stage. [dry-run]");
+    info!(target: "reth::cli", "Executing stage.");
 
     let mut tx = Transaction::new(&output_db)?;
-    let mut stage = StorageHashingStage { clean_threshold: 1, ..Default::default() };
+    let mut exec_stage = StorageHashingStage {
+        clean_threshold: 1, // Forces hashing from scratch
+        ..Default::default()
+    };
 
-    stage
-        .execute(
-            &mut tx,
-            reth_stages::ExecInput {
-                previous_stage: Some((StageId("Another"), to)),
-                stage_progress: Some(from),
-            },
-        )
-        .await?;
+    let mut exec_output = false;
+    while !exec_output {
+        exec_output = exec_stage
+            .execute(
+                &mut tx,
+                reth_stages::ExecInput {
+                    previous_stage: Some((StageId("Another"), to)),
+                    stage_progress: Some(from),
+                },
+            )
+            .await?
+            .done;
+    }
 
     tx.drop()?;
 

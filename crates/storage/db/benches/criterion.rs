@@ -3,10 +3,18 @@
 use criterion::{
     black_box, criterion_group, criterion_main, measurement::WallTime, BenchmarkGroup, Criterion,
 };
-use reth_db::cursor::{DbDupCursorRO, DbDupCursorRW};
+use pprof::criterion::{Output, PProfProfiler};
+use reth_db::{
+    cursor::{DbCursorRO, DbCursorRW, DbDupCursorRO, DbDupCursorRW},
+    tables::*,
+};
 use std::time::Instant;
 
-criterion_group!(benches, db, serialization);
+criterion_group! {
+    name = benches;
+    config = Criterion::default().with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
+    targets = db, serialization
+}
 criterion_main!(benches);
 
 pub fn db(c: &mut Criterion) {
@@ -18,11 +26,9 @@ pub fn db(c: &mut Criterion) {
     measure_table_db::<HeaderTD>(&mut group);
     measure_table_db::<HeaderNumbers>(&mut group);
     measure_table_db::<Headers>(&mut group);
-    measure_table_db::<BlockBodies>(&mut group);
+    measure_table_db::<BlockBodyIndices>(&mut group);
     measure_table_db::<BlockOmmers>(&mut group);
     measure_table_db::<TxHashNumber>(&mut group);
-    measure_table_db::<BlockTransitionIndex>(&mut group);
-    measure_table_db::<TxTransitionIndex>(&mut group);
     measure_table_db::<Transactions>(&mut group);
     measure_dupsort_db::<PlainStorageState>(&mut group);
     measure_table_db::<PlainAccountState>(&mut group);
@@ -37,11 +43,9 @@ pub fn serialization(c: &mut Criterion) {
     measure_table_serialization::<HeaderTD>(&mut group);
     measure_table_serialization::<HeaderNumbers>(&mut group);
     measure_table_serialization::<Headers>(&mut group);
-    measure_table_serialization::<BlockBodies>(&mut group);
+    measure_table_serialization::<BlockBodyIndices>(&mut group);
     measure_table_serialization::<BlockOmmers>(&mut group);
     measure_table_serialization::<TxHashNumber>(&mut group);
-    measure_table_serialization::<BlockTransitionIndex>(&mut group);
-    measure_table_serialization::<TxTransitionIndex>(&mut group);
     measure_table_serialization::<Transactions>(&mut group);
     measure_table_serialization::<PlainStorageState>(&mut group);
     measure_table_serialization::<PlainAccountState>(&mut group);
@@ -59,11 +63,12 @@ where
         b.iter_with_setup(
             || input.clone(),
             |input| {
-                black_box({
+                {
                     for (k, _, _, _) in input {
                         k.encode();
                     }
-                });
+                };
+                black_box(());
             },
         )
     });
@@ -72,11 +77,12 @@ where
         b.iter_with_setup(
             || input.clone(),
             |input| {
-                black_box({
+                {
                     for (_, k, _, _) in input {
                         let _ = <T as Table>::Key::decode(k);
                     }
-                });
+                };
+                black_box(());
             },
         )
     });
@@ -85,11 +91,12 @@ where
         b.iter_with_setup(
             || input.clone(),
             |input| {
-                black_box({
+                {
                     for (_, _, v, _) in input {
                         v.compress();
                     }
-                });
+                };
+                black_box(());
             },
         )
     });
@@ -98,11 +105,12 @@ where
         b.iter_with_setup(
             || input.clone(),
             |input| {
-                black_box({
+                {
                     for (_, _, _, v) in input {
                         let _ = <T as Table>::Value::decompress(v);
                     }
-                });
+                };
+                black_box(());
             },
         )
     });
@@ -135,7 +143,7 @@ where
                         crsr.append(k, v).expect("submit");
                     }
 
-                    tx.inner.commit().unwrap();
+                    tx.inner.commit().unwrap()
                 });
             },
         )
@@ -159,7 +167,7 @@ where
                         crsr.insert(k, v).expect("submit");
                     }
 
-                    tx.inner.commit().unwrap();
+                    tx.inner.commit().unwrap()
                 });
             },
         )
@@ -172,13 +180,14 @@ where
             // Create TX
             let tx = db.tx().expect("tx");
 
-            black_box({
+            {
                 let mut cursor = tx.cursor_read::<T>().expect("cursor");
                 let walker = cursor.walk(Some(input.first().unwrap().0.clone())).unwrap();
                 for element in walker {
                     element.unwrap();
                 }
-            });
+            };
+            black_box(());
         })
     });
 
@@ -189,12 +198,13 @@ where
             // Create TX
             let tx = db.tx().expect("tx");
 
-            black_box({
+            {
                 for index in RANDOM_INDEXES {
                     let mut cursor = tx.cursor_read::<T>().expect("cursor");
                     cursor.seek_exact(input.get(index).unwrap().0.clone()).unwrap();
                 }
-            });
+            };
+            black_box(());
         })
     });
 }
@@ -227,7 +237,7 @@ where
                         crsr.append_dup(k, v).expect("submit");
                     }
 
-                    tx.inner.commit().unwrap();
+                    tx.inner.commit().unwrap()
                 });
             },
         )
@@ -262,13 +272,14 @@ where
             // Create TX
             let tx = db.tx().expect("tx");
 
-            black_box({
+            {
                 let mut cursor = tx.cursor_dup_read::<T>().expect("cursor");
                 let walker = cursor.walk_dup(None, Some(T::SubKey::default())).unwrap();
                 for element in walker {
                     element.unwrap();
                 }
-            });
+            };
+            black_box(());
         })
     });
 

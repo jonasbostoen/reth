@@ -17,7 +17,7 @@ use reth_ecies::{stream::ECIESStream, ECIESError};
 use reth_eth_wire::{
     capability::{Capabilities, CapabilityMessage},
     errors::EthStreamError,
-    DisconnectReason, HelloMessage, Status, UnauthedEthStream, UnauthedP2PStream,
+    DisconnectReason, EthVersion, HelloMessage, Status, UnauthedEthStream, UnauthedP2PStream,
 };
 use reth_metrics_common::metered_sender::MeteredSender;
 use reth_net_common::{
@@ -25,7 +25,7 @@ use reth_net_common::{
     stream::HasRemoteAddr,
 };
 use reth_primitives::{ForkFilter, ForkId, ForkTransition, Head, PeerId};
-use reth_tasks::TaskExecutor;
+use reth_tasks::TaskSpawner;
 use secp256k1::SecretKey;
 use std::{
     collections::HashMap,
@@ -77,7 +77,7 @@ pub(crate) struct SessionManager {
     /// Size of the command buffer per session.
     session_command_buffer: usize,
     /// The executor for spawned tasks.
-    executor: Option<TaskExecutor>,
+    executor: Box<dyn TaskSpawner>,
     /// All pending session that are currently handshaking, exchanging `Hello`s.
     ///
     /// Events produced during the authentication phase are reported to this manager. Once the
@@ -110,7 +110,7 @@ impl SessionManager {
     pub(crate) fn new(
         secret_key: SecretKey,
         config: SessionsConfig,
-        executor: Option<TaskExecutor>,
+        executor: Box<dyn TaskSpawner>,
         status: Status,
         hello_message: HelloMessage,
         fork_filter: ForkFilter,
@@ -169,11 +169,7 @@ impl SessionManager {
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        if let Some(ref executor) = self.executor {
-            executor.spawn(async move { f.await });
-        } else {
-            tokio::task::spawn(async move { f.await });
-        }
+        self.executor.spawn(f.boxed());
     }
 
     /// Invoked on a received status update.
@@ -213,20 +209,17 @@ impl SessionManager {
         let hello_message = self.hello_message.clone();
         let status = self.status;
         let fork_filter = self.fork_filter.clone();
-        self.spawn(Box::pin(async move {
-            start_pending_incoming_session(
-                disconnect_rx,
-                session_id,
-                metered_stream,
-                pending_events,
-                remote_addr,
-                secret_key,
-                hello_message,
-                status,
-                fork_filter,
-            )
-            .await
-        }));
+        self.spawn(start_pending_incoming_session(
+            disconnect_rx,
+            session_id,
+            metered_stream,
+            pending_events,
+            remote_addr,
+            secret_key,
+            hello_message,
+            status,
+            fork_filter,
+        ));
 
         let handle = PendingSessionHandle {
             disconnect_tx: Some(disconnect_tx),
@@ -247,21 +240,18 @@ impl SessionManager {
         let fork_filter = self.fork_filter.clone();
         let status = self.status;
         let band_with_meter = self.bandwidth_meter.clone();
-        self.spawn(Box::pin(async move {
-            start_pending_outbound_session(
-                disconnect_rx,
-                pending_events,
-                session_id,
-                remote_addr,
-                remote_peer_id,
-                secret_key,
-                hello_message,
-                status,
-                fork_filter,
-                band_with_meter,
-            )
-            .await
-        }));
+        self.spawn(start_pending_outbound_session(
+            disconnect_rx,
+            pending_events,
+            session_id,
+            remote_addr,
+            remote_peer_id,
+            secret_key,
+            hello_message,
+            status,
+            fork_filter,
+            band_with_meter,
+        ));
 
         let handle = PendingSessionHandle {
             disconnect_tx: Some(disconnect_tx),
@@ -438,6 +428,9 @@ impl SessionManager {
                     self.initial_internal_request_timeout.as_millis() as u64,
                 ));
 
+                // negotiated version
+                let version = conn.version();
+
                 let session = ActiveSession {
                     next_id: 0,
                     remote_peer_id: peer_id,
@@ -465,6 +458,7 @@ impl SessionManager {
                     direction,
                     session_id,
                     remote_id: peer_id,
+                    version,
                     established: Instant::now(),
                     capabilities: Arc::clone(&capabilities),
                     commands_to_session,
@@ -478,6 +472,7 @@ impl SessionManager {
                 Poll::Ready(SessionEvent::SessionEstablished {
                     peer_id,
                     remote_addr,
+                    version,
                     capabilities,
                     status,
                     messages,
@@ -594,6 +589,8 @@ pub(crate) enum SessionEvent {
         peer_id: PeerId,
         remote_addr: SocketAddr,
         capabilities: Arc<Capabilities>,
+        /// negotiated eth version
+        version: EthVersion,
         status: Status,
         messages: PeerRequestSender,
         direction: Direction,
@@ -666,6 +663,16 @@ pub(crate) enum SessionEvent {
 pub(crate) enum PendingSessionHandshakeError {
     Eth(EthStreamError),
     Ecies(ECIESError),
+}
+
+impl PendingSessionHandshakeError {
+    /// Returns the [`DisconnectReason`] if the error is a disconnect message
+    pub fn as_disconnected(&self) -> Option<DisconnectReason> {
+        match self {
+            PendingSessionHandshakeError::Eth(eth_err) => eth_err.as_disconnected(),
+            _ => None,
+        }
+    }
 }
 
 /// The direction of the connection.

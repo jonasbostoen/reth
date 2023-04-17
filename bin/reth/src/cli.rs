@@ -2,9 +2,9 @@
 use std::str::FromStr;
 
 use crate::{
-    chain, db,
+    chain, config, db,
     dirs::{LogsDir, PlatformPath},
-    dump_stage, node, p2p,
+    drop_stage, dump_stage, node, p2p,
     runner::CliRunner,
     stage, test_eth_chain, test_vectors,
 };
@@ -19,8 +19,11 @@ use reth_tracing::{
 pub fn run() -> eyre::Result<()> {
     let opt = Cli::parse();
 
-    let (layer, _guard) = opt.logs.layer();
-    reth_tracing::init(vec![layer, reth_tracing::stdout(opt.verbosity.directive())]);
+    let mut layers = vec![reth_tracing::stdout(opt.verbosity.directive())];
+    if let Some((layer, _guard)) = opt.logs.layer() {
+        layers.push(layer);
+    }
+    reth_tracing::init(layers);
 
     let runner = CliRunner::default();
 
@@ -31,14 +34,16 @@ pub fn run() -> eyre::Result<()> {
         Commands::Db(command) => runner.run_until_ctrl_c(command.execute()),
         Commands::Stage(command) => runner.run_until_ctrl_c(command.execute()),
         Commands::DumpStage(command) => runner.run_until_ctrl_c(command.execute()),
+        Commands::DropStage(command) => runner.run_until_ctrl_c(command.execute()),
         Commands::P2P(command) => runner.run_until_ctrl_c(command.execute()),
         Commands::TestVectors(command) => runner.run_until_ctrl_c(command.execute()),
         Commands::TestEthChain(command) => runner.run_until_ctrl_c(command.execute()),
+        Commands::Config(command) => runner.run_until_ctrl_c(command.execute()),
     }
 }
 
 /// Commands to be executed
-#[derive(Subcommand)]
+#[derive(Debug, Subcommand)]
 pub enum Commands {
     /// Start the node
     #[command(name = "node")]
@@ -63,6 +68,9 @@ pub enum Commands {
     /// Dumps a stage from a range into a new database.
     #[command(name = "dump-stage")]
     DumpStage(dump_stage::Command),
+    /// Drops a stage's tables from the database.
+    #[command(name = "drop-stage")]
+    DropStage(drop_stage::Command),
     /// P2P Debugging utilities
     #[command(name = "p2p")]
     P2P(p2p::Command),
@@ -72,9 +80,12 @@ pub enum Commands {
     /// Generate Test Vectors
     #[command(name = "test-vectors")]
     TestVectors(test_vectors::Command),
+    /// Write config to stdout
+    #[command(name = "config")]
+    Config(config::Command),
 }
 
-#[derive(Parser)]
+#[derive(Debug, Parser)]
 #[command(author, version = "0.1", about = "Reth", long_about = None)]
 struct Cli {
     /// The command to run
@@ -88,9 +99,14 @@ struct Cli {
     verbosity: Verbosity,
 }
 
-#[derive(Args)]
+/// The log configuration.
+#[derive(Debug, Args)]
 #[command(next_help_heading = "Logging")]
-struct Logs {
+pub struct Logs {
+    /// The flag to enable persistent logs.
+    #[arg(long = "log.persistent", global = true, conflicts_with = "journald")]
+    persistent: bool,
+
     /// The path to put log files in.
     #[arg(
         long = "log.directory",
@@ -112,7 +128,7 @@ struct Logs {
 
 impl Logs {
     /// Builds a tracing layer from the current log options.
-    fn layer<S>(&self) -> (BoxedLayer<S>, Option<FileWorkerGuard>)
+    pub fn layer<S>(&self) -> Option<(BoxedLayer<S>, Option<FileWorkerGuard>)>
     where
         S: Subscriber,
         for<'a> S: LookupSpan<'a>,
@@ -121,17 +137,20 @@ impl Logs {
             .unwrap_or_else(|_| Directive::from_str("debug").unwrap());
 
         if self.journald {
-            (reth_tracing::journald(directive).expect("Could not connect to journald"), None)
-        } else {
+            Some((reth_tracing::journald(directive).expect("Could not connect to journald"), None))
+        } else if self.persistent {
             let (layer, guard) = reth_tracing::file(directive, &self.log_directory, "reth.log");
-            (layer, Some(guard))
+            Some((layer, Some(guard)))
+        } else {
+            None
         }
     }
 }
 
-#[derive(Args)]
+/// The verbosity settings for the cli.
+#[derive(Debug, Copy, Clone, Args)]
 #[command(next_help_heading = "Display")]
-struct Verbosity {
+pub struct Verbosity {
     /// Set the minimum log level.
     ///
     /// -v      Errors
@@ -150,7 +169,7 @@ struct Verbosity {
 impl Verbosity {
     /// Get the corresponding [Directive] for the given verbosity, or none if the verbosity
     /// corresponds to silent.
-    fn directive(&self) -> Directive {
+    pub fn directive(&self) -> Directive {
         if self.quiet {
             LevelFilter::OFF.into()
         } else {
@@ -163,6 +182,26 @@ impl Verbosity {
             };
 
             format!("reth::cli={level}").parse().unwrap()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    /// Tests that the help message is parsed correctly. This ensures that clap args are configured
+    /// correctly and no conflicts are introduced via attributes that would result in a panic at
+    /// runtime
+    #[test]
+    fn test_parse_help_all_subcommands() {
+        let reth = Cli::command();
+        for sub_command in reth.get_subcommands() {
+            let err = Cli::try_parse_from(["reth", sub_command.get_name(), "--help"]).unwrap_err();
+            // --help is treated as error, but
+            // > Not a true "error" as it means --help or similar was used. The help message will be sent to stdout.
+            assert_eq!(err.kind(), clap::error::ErrorKind::DisplayHelp);
         }
     }
 }

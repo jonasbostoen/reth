@@ -81,20 +81,23 @@
 
 pub use crate::{
     config::PoolConfig,
-    ordering::TransactionOrdering,
+    ordering::{CostOrdering, TransactionOrdering},
     traits::{
-        BestTransactions, OnNewBlockEvent, PoolTransaction, PropagateKind, PropagatedTransactions,
-        TransactionOrigin, TransactionPool,
+        BestTransactions, OnNewBlockEvent, PoolTransaction, PooledTransaction, PropagateKind,
+        PropagatedTransactions, TransactionOrigin, TransactionPool,
     },
-    validate::{TransactionValidationOutcome, TransactionValidator},
+    validate::{
+        EthTransactionValidator, TransactionValidationOutcome, TransactionValidator,
+        ValidPoolTransaction,
+    },
 };
 use crate::{
-    error::PoolResult,
+    error::{PoolError, PoolResult},
     pool::PoolInner,
     traits::{NewTransactionEvent, PoolSize},
-    validate::ValidPoolTransaction,
 };
-use reth_primitives::{TxHash, U256};
+use reth_primitives::{Address, TxHash, U256};
+use reth_provider::StateProviderFactory;
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::mpsc::Receiver;
 
@@ -111,6 +114,24 @@ mod validate;
 /// Common test helpers for mocking A pool
 pub mod test_utils;
 
+// TX_SLOT_SIZE is used to calculate how many data slots a single transaction
+// takes up based on its size. The slots are used as DoS protection, ensuring
+// that validating a new transaction remains a constant operation (in reality
+// O(maxslots), where max slots are 4 currently).
+pub(crate) const TX_SLOT_SIZE: usize = 32 * 1024;
+
+// TX_MAX_SIZE is the maximum size a single transaction can have. This field has
+// non-trivial consequences: larger transactions are significantly harder and
+// more expensive to propagate; larger transactions also take more resources
+// to validate whether they fit into the pool or not.
+pub(crate) const TX_MAX_SIZE: usize = 4 * TX_SLOT_SIZE; //128KB
+
+// Maximum bytecode to permit for a contract
+pub(crate) const MAX_CODE_SIZE: usize = 24576;
+
+// Maximum initcode to permit in a creation transaction and create instructions
+pub(crate) const MAX_INIT_CODE_SIZE: usize = 2 * MAX_CODE_SIZE;
+
 /// A shareable, generic, customizable `TransactionPool` implementation.
 #[derive(Debug)]
 pub struct Pool<V: TransactionValidator, T: TransactionOrdering> {
@@ -126,8 +147,8 @@ where
     T: TransactionOrdering<Transaction = <V as TransactionValidator>::Transaction>,
 {
     /// Create a new transaction pool instance.
-    pub fn new(client: Arc<V>, ordering: Arc<T>, config: PoolConfig) -> Self {
-        Self { pool: Arc::new(PoolInner::new(client, ordering, config)) }
+    pub fn new(validator: V, ordering: T, config: PoolConfig) -> Self {
+        Self { pool: Arc::new(PoolInner::new(validator, ordering, config)) }
     }
 
     /// Returns the wrapped pool.
@@ -163,8 +184,10 @@ where
         transaction: V::Transaction,
     ) -> (TxHash, TransactionValidationOutcome<V::Transaction>) {
         let hash = *transaction.hash();
+
         // TODO(mattsse): this is where additional validate checks would go, like banned senders
         // etc...
+
         let outcome = self.pool.validator().validate_transaction(origin, transaction).await;
 
         (hash, outcome)
@@ -178,6 +201,21 @@ where
     /// Whether the pool is empty
     pub fn is_empty(&self) -> bool {
         self.pool.is_empty()
+    }
+}
+
+impl<Client>
+    Pool<EthTransactionValidator<Client, PooledTransaction>, CostOrdering<PooledTransaction>>
+where
+    Client: StateProviderFactory,
+{
+    /// Returns a new [Pool] that uses the default [EthTransactionValidator] when validating
+    /// [PooledTransaction]s and ords via [CostOrdering]
+    pub fn eth_pool(
+        validator: EthTransactionValidator<Client, PooledTransaction>,
+        config: PoolConfig,
+    ) -> Self {
+        Self::new(validator, CostOrdering::default(), config)
     }
 }
 
@@ -204,7 +242,18 @@ where
         transaction: Self::Transaction,
     ) -> PoolResult<TxHash> {
         let (_, tx) = self.validate(origin, transaction).await;
-        self.pool.add_transactions(origin, std::iter::once(tx)).pop().expect("exists; qed")
+
+        match tx {
+            TransactionValidationOutcome::Valid { .. } => {
+                self.pool.add_transactions(origin, std::iter::once(tx)).pop().expect("exists; qed")
+            }
+            TransactionValidationOutcome::Invalid(transaction, error) => {
+                Err(PoolError::InvalidTransaction(*transaction.hash(), error))
+            }
+            TransactionValidationOutcome::Error(transaction, error) => {
+                Err(PoolError::Other(*transaction.hash(), error))
+            }
+        }
     }
 
     async fn add_transactions(
@@ -213,6 +262,7 @@ where
         transactions: Vec<Self::Transaction>,
     ) -> PoolResult<Vec<PoolResult<TxHash>>> {
         let validated = self.validate_all(origin, transactions).await?;
+
         let transactions = self.pool.add_transactions(origin, validated.into_values());
         Ok(transactions)
     }
@@ -225,8 +275,23 @@ where
         self.pool.add_transaction_listener()
     }
 
-    fn pooled_transactions(&self) -> Vec<TxHash> {
+    fn pooled_transaction_hashes(&self) -> Vec<TxHash> {
+        self.pool.pooled_transactions_hashes()
+    }
+
+    fn pooled_transaction_hashes_max(&self, max: usize) -> Vec<TxHash> {
+        self.pooled_transaction_hashes().into_iter().take(max).collect()
+    }
+
+    fn pooled_transactions(&self) -> Vec<Arc<ValidPoolTransaction<Self::Transaction>>> {
         self.pool.pooled_transactions()
+    }
+
+    fn pooled_transactions_max(
+        &self,
+        max: usize,
+    ) -> Vec<Arc<ValidPoolTransaction<Self::Transaction>>> {
+        self.pooled_transactions().into_iter().take(max).collect()
     }
 
     fn best_transactions(
@@ -235,11 +300,11 @@ where
         Box::new(self.pool.best_transactions())
     }
 
-    fn remove_invalid(
+    fn remove_transactions(
         &self,
         hashes: impl IntoIterator<Item = TxHash>,
     ) -> Vec<Arc<ValidPoolTransaction<Self::Transaction>>> {
-        self.pool.remove_invalid(hashes)
+        self.pool.remove_transactions(hashes)
     }
 
     fn retain_unknown(&self, hashes: &mut Vec<TxHash>) {
@@ -260,9 +325,16 @@ where
     fn on_propagated(&self, txs: PropagatedTransactions) {
         self.inner().on_propagated(txs)
     }
+
+    fn get_transactions_by_sender(
+        &self,
+        sender: Address,
+    ) -> Vec<Arc<ValidPoolTransaction<Self::Transaction>>> {
+        self.pool.get_transactions_by_sender(sender)
+    }
 }
 
-impl<V: TransactionValidator, O: TransactionOrdering> Clone for Pool<V, O> {
+impl<V: TransactionValidator, T: TransactionOrdering> Clone for Pool<V, T> {
     fn clone(&self) -> Self {
         Self { pool: Arc::clone(&self.pool) }
     }

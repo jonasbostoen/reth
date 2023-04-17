@@ -8,9 +8,10 @@
 //! reth task management
 
 use crate::shutdown::{signal, Shutdown, Signal};
+use dyn_clone::DynClone;
 use futures_util::{
     future::{select, BoxFuture},
-    pin_mut, Future, FutureExt,
+    pin_mut, Future, FutureExt, TryFutureExt,
 };
 use std::{
     pin::Pin,
@@ -30,17 +31,61 @@ pub mod shutdown;
 ///
 /// The main purpose of this type is to abstract over [TaskExecutor] so it's more convenient to
 /// provide default impls for testing.
-pub trait TaskSpawner: Send + Sync {
+///
+///
+/// # Examples
+///
+/// Use the [TokioTaskExecutor] that spawns with [tokio::task::spawn]
+///
+/// ```
+/// # async fn t() {
+///  use reth_tasks::{TaskSpawner, TokioTaskExecutor};
+/// let executor = TokioTaskExecutor::default();
+///
+/// let task = executor.spawn(Box::pin(async {
+///     // -- snip --
+/// }));
+/// task.await.unwrap();
+/// # }
+/// ```
+///
+/// Use the [TaskExecutor] that spawns task directly onto the tokio runtime via the [Handle].
+///
+/// ```
+/// # use reth_tasks::TaskManager;
+/// fn t() {
+///  use reth_tasks::TaskSpawner;
+/// let rt = tokio::runtime::Runtime::new().unwrap();
+/// let manager = TaskManager::new(rt.handle().clone());
+/// let executor = manager.executor();
+/// let task = TaskSpawner::spawn(&executor, Box::pin(async {
+///     // -- snip --
+/// }));
+/// rt.block_on(task).unwrap();
+/// # }
+/// ```
+///
+/// The [TaskSpawner] trait is [DynClone] so `Box<dyn TaskSpawner>` are also `Clone`.
+pub trait TaskSpawner: Send + Sync + Unpin + std::fmt::Debug + DynClone {
     /// Spawns the task onto the runtime.
     /// See also [`Handle::spawn`].
     fn spawn(&self, fut: BoxFuture<'static, ()>) -> JoinHandle<()>;
+
+    /// This spawns a critical task onto the runtime.
+    fn spawn_critical(&self, name: &'static str, fut: BoxFuture<'static, ()>) -> JoinHandle<()>;
+
+    /// Spawns a blocking task onto the runtime.
+    fn spawn_blocking(&self, fut: BoxFuture<'static, ()>) -> JoinHandle<()>;
+
+    /// This spawns a critical blocking task onto the runtime.
+    fn spawn_critical_blocking(
+        &self,
+        name: &'static str,
+        fut: BoxFuture<'static, ()>,
+    ) -> JoinHandle<()>;
 }
 
-impl TaskSpawner for Box<dyn TaskSpawner> {
-    fn spawn(&self, fut: BoxFuture<'static, ()>) -> JoinHandle<()> {
-        (**self).spawn(fut)
-    }
-}
+dyn_clone::clone_trait_object!(TaskSpawner);
 
 /// An [TaskSpawner] that uses [tokio::task::spawn] to execute tasks
 #[derive(Debug, Clone, Default)]
@@ -50,6 +95,22 @@ pub struct TokioTaskExecutor;
 impl TaskSpawner for TokioTaskExecutor {
     fn spawn(&self, fut: BoxFuture<'static, ()>) -> JoinHandle<()> {
         tokio::task::spawn(fut)
+    }
+
+    fn spawn_critical(&self, _name: &'static str, fut: BoxFuture<'static, ()>) -> JoinHandle<()> {
+        tokio::task::spawn(fut)
+    }
+
+    fn spawn_blocking(&self, fut: BoxFuture<'static, ()>) -> JoinHandle<()> {
+        tokio::task::spawn_blocking(move || tokio::runtime::Handle::current().block_on(fut))
+    }
+
+    fn spawn_critical_blocking(
+        &self,
+        _name: &'static str,
+        fut: BoxFuture<'static, ()>,
+    ) -> JoinHandle<()> {
+        tokio::task::spawn_blocking(move || tokio::runtime::Handle::current().block_on(fut))
     }
 }
 
@@ -230,7 +291,7 @@ impl TaskExecutor {
         // wrap the task in catch unwind
         let task = std::panic::AssertUnwindSafe(fut)
             .catch_unwind()
-            .map(move |res| {
+            .inspect_err(move |res| {
                 error!("Critical task `{name}` panicked: {res:?}");
                 let _ = panicked_tasks_tx.send(name);
             })
@@ -284,10 +345,11 @@ impl TaskExecutor {
         // wrap the task in catch unwind
         let task = std::panic::AssertUnwindSafe(fut)
             .catch_unwind()
-            .map(move |res| {
+            .inspect_err(move |res| {
                 error!("Critical task `{name}` panicked: {res:?}");
                 let _ = panicked_tasks_tx.send(name);
             })
+            .map(|_| ())
             .in_current_span();
 
         self.handle.spawn(task)
@@ -297,6 +359,22 @@ impl TaskExecutor {
 impl TaskSpawner for TaskExecutor {
     fn spawn(&self, fut: BoxFuture<'static, ()>) -> JoinHandle<()> {
         self.spawn(fut)
+    }
+
+    fn spawn_critical(&self, name: &'static str, fut: BoxFuture<'static, ()>) -> JoinHandle<()> {
+        TaskExecutor::spawn_critical(self, name, fut)
+    }
+
+    fn spawn_blocking(&self, fut: BoxFuture<'static, ()>) -> JoinHandle<()> {
+        self.spawn_blocking(fut)
+    }
+
+    fn spawn_critical_blocking(
+        &self,
+        name: &'static str,
+        fut: BoxFuture<'static, ()>,
+    ) -> JoinHandle<()> {
+        TaskExecutor::spawn_critical_blocking(self, name, fut)
     }
 }
 
@@ -312,6 +390,20 @@ enum TaskKind {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn test_cloneable() {
+        #[derive(Clone)]
+        struct ExecutorWrapper {
+            _e: Box<dyn TaskSpawner>,
+        }
+
+        let executor: Box<dyn TaskSpawner> = Box::<TokioTaskExecutor>::default();
+        let _e = dyn_clone::clone_box(&*executor);
+
+        let e = ExecutorWrapper { _e };
+        let _e2 = e;
+    }
 
     #[test]
     fn test_critical() {

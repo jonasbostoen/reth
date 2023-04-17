@@ -1,8 +1,9 @@
 use crate::{error::PoolResult, pool::state::SubPool, validate::ValidPoolTransaction};
 use reth_primitives::{
     Address, FromRecoveredTransaction, IntoRecoveredTransaction, PeerId, Transaction,
-    TransactionKind, TransactionSignedEcRecovered, TxHash, H256, U256,
+    TransactionKind, TransactionSignedEcRecovered, TxHash, EIP1559_TX_TYPE_ID, H256, U256,
 };
+use reth_rlp::Encodable;
 use std::{collections::HashMap, fmt, sync::Arc};
 use tokio::sync::mpsc::Receiver;
 
@@ -18,6 +19,7 @@ use serde::{Deserialize, Serialize};
 /// Note: This requires `Clone` for convenience, since it is assumed that this will be implemented
 /// for a wrapped `Arc` type, see also [`Pool`](crate::Pool).
 #[async_trait::async_trait]
+#[auto_impl::auto_impl(Arc)]
 pub trait TransactionPool: Send + Sync + Clone {
     /// The transaction type of the pool
     type Transaction: PoolTransaction;
@@ -70,12 +72,32 @@ pub trait TransactionPool: Send + Sync + Clone {
     /// Returns a new stream that yields new valid transactions added to the pool.
     fn transactions_listener(&self) -> Receiver<NewTransactionEvent<Self::Transaction>>;
 
-    /// Returns hashes of all transactions in the pool.
+    /// Returns the _hashes_ of all transactions in the pool.
     ///
     /// Note: This returns a `Vec` but should guarantee that all hashes are unique.
     ///
     /// Consumer: P2P
-    fn pooled_transactions(&self) -> Vec<TxHash>;
+    fn pooled_transaction_hashes(&self) -> Vec<TxHash>;
+
+    /// Returns only the first `max` hashes of transactions in the pool.
+    ///
+    /// Consumer: P2P
+    fn pooled_transaction_hashes_max(&self, max: usize) -> Vec<TxHash>;
+
+    /// Returns the _full_ transaction objects all transactions in the pool.
+    ///
+    /// Note: This returns a `Vec` but should guarantee that all transactions are unique.
+    ///
+    /// Consumer: P2P
+    fn pooled_transactions(&self) -> Vec<Arc<ValidPoolTransaction<Self::Transaction>>>;
+
+    /// Returns only the first `max` transactions in the pool.
+    ///
+    /// Consumer: P2P
+    fn pooled_transactions_max(
+        &self,
+        max: usize,
+    ) -> Vec<Arc<ValidPoolTransaction<Self::Transaction>>>;
 
     /// Returns an iterator that yields transactions that are ready for block production.
     ///
@@ -89,7 +111,7 @@ pub trait TransactionPool: Send + Sync + Clone {
     /// Also removes all dependent transactions.
     ///
     /// Consumer: Block production
-    fn remove_invalid(
+    fn remove_transactions(
         &self,
         hashes: impl IntoIterator<Item = TxHash>,
     ) -> Vec<Arc<ValidPoolTransaction<Self::Transaction>>>;
@@ -123,6 +145,12 @@ pub trait TransactionPool: Send + Sync + Clone {
     ///
     /// Consumer: P2P
     fn on_propagated(&self, txs: PropagatedTransactions);
+
+    /// Returns all transactions sent by a given user
+    fn get_transactions_by_sender(
+        &self,
+        sender: Address,
+    ) -> Vec<Arc<ValidPoolTransaction<Self::Transaction>>>;
 }
 
 /// Represents a transaction that was propagated over the network.
@@ -241,7 +269,9 @@ impl<T> BestTransactions for std::iter::Empty<T> {
 }
 
 /// Trait for transaction types used inside the pool
-pub trait PoolTransaction: fmt::Debug + Send + Sync + FromRecoveredTransaction {
+pub trait PoolTransaction:
+    fmt::Debug + Send + Sync + FromRecoveredTransaction + IntoRecoveredTransaction
+{
     /// Hash of the transaction.
     fn hash(&self) -> &TxHash;
 
@@ -280,6 +310,20 @@ pub trait PoolTransaction: fmt::Debug + Send + Sync + FromRecoveredTransaction {
 
     /// Returns a measurement of the heap usage of this type and all its internals.
     fn size(&self) -> usize;
+
+    /// Returns the transaction type
+    fn tx_type(&self) -> u8;
+
+    /// Returns true if the transaction is an EIP-1559 transaction.
+    fn is_eip1559(&self) -> bool {
+        self.tx_type() == EIP1559_TX_TYPE_ID
+    }
+
+    /// Returns the length of the rlp encoded object
+    fn encoded_length(&self) -> usize;
+
+    /// Returns chain_id
+    fn chain_id(&self) -> Option<u64>;
 }
 
 /// The default [PoolTransaction] for the [Pool](crate::Pool).
@@ -287,7 +331,7 @@ pub trait PoolTransaction: fmt::Debug + Send + Sync + FromRecoveredTransaction {
 /// This type is essentially a wrapper around [TransactionSignedEcRecovered] with additional fields
 /// derived from the transaction that are frequently used by the pools for ordering.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct PooledTransaction {
+pub struct PooledTransaction {
     /// EcRecovered transaction info
     pub(crate) transaction: TransactionSignedEcRecovered,
 
@@ -296,6 +340,13 @@ pub(crate) struct PooledTransaction {
 
     /// This is `priority + basefee`for EIP-1559 and `gasPrice` for legacy transactions.
     pub(crate) effective_gas_price: u128,
+}
+
+impl PooledTransaction {
+    /// Return the reference to the underlying transaction.
+    pub fn transaction(&self) -> &TransactionSignedEcRecovered {
+        &self.transaction
+    }
 }
 
 impl PoolTransaction for PooledTransaction {
@@ -364,6 +415,21 @@ impl PoolTransaction for PooledTransaction {
     /// Returns a measurement of the heap usage of this type and all its internals.
     fn size(&self) -> usize {
         self.transaction.transaction.input().len()
+    }
+
+    /// Returns the transaction type
+    fn tx_type(&self) -> u8 {
+        self.transaction.tx_type().into()
+    }
+
+    /// Returns the length of the rlp encoded object
+    fn encoded_length(&self) -> usize {
+        self.transaction.length()
+    }
+
+    /// Returns chain_id
+    fn chain_id(&self) -> Option<u64> {
+        self.transaction.chain_id()
     }
 }
 

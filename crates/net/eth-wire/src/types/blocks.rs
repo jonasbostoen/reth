@@ -1,9 +1,7 @@
 //! Implements the `GetBlockHeaders`, `GetBlockBodies`, `BlockHeaders`, and `BlockBodies` message
 //! types.
 use reth_codecs::derive_arbitrary;
-use reth_primitives::{
-    Block, BlockHashOrNumber, Header, HeadersDirection, TransactionSigned, H256,
-};
+use reth_primitives::{BlockBody, BlockHashOrNumber, Header, HeadersDirection, H256};
 use reth_rlp::{RlpDecodable, RlpDecodableWrapper, RlpEncodable, RlpEncodableWrapper};
 
 #[cfg(feature = "serde")]
@@ -65,29 +63,6 @@ pub struct GetBlockBodies(
 impl From<Vec<H256>> for GetBlockBodies {
     fn from(hashes: Vec<H256>) -> Self {
         GetBlockBodies(hashes)
-    }
-}
-
-// TODO(onbjerg): We should have this type in primitives
-/// A response to [`GetBlockBodies`], containing bodies if any bodies were found.
-#[derive_arbitrary(rlp, 10)]
-#[derive(Clone, Debug, PartialEq, Eq, RlpEncodable, RlpDecodable, Default)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-pub struct BlockBody {
-    /// Transactions in the block
-    pub transactions: Vec<TransactionSigned>,
-    /// Uncle headers for the given block
-    pub ommers: Vec<Header>,
-}
-
-impl BlockBody {
-    /// Create a [`Block`](reth_primitives::Block) from the body and its header.
-    pub fn create_block(&self, header: &Header) -> Block {
-        Block {
-            header: header.clone(),
-            body: self.transactions.clone(),
-            ommers: self.ommers.clone(),
-        }
     }
 }
 
@@ -276,6 +251,7 @@ mod test {
                     mix_hash: hex!("0000000000000000000000000000000000000000000000000000000000000000").into(),
                     nonce: 0x0000000000000000u64,
                     base_fee_per_gas: None,
+                    withdrawals_root: None,
                 },
             ]),
         }.encode(&mut data);
@@ -306,6 +282,7 @@ mod test {
                     mix_hash: hex!("0000000000000000000000000000000000000000000000000000000000000000").into(),
                     nonce: 0x0000000000000000u64,
                     base_fee_per_gas: None,
+                    withdrawals_root: None,
                 },
             ]),
         };
@@ -417,8 +394,10 @@ mod test {
     hex!("0000000000000000000000000000000000000000000000000000000000000000").into(),
                             nonce: 0x0000000000000000u64,
                             base_fee_per_gas: None,
+                            withdrawals_root: None,
                         },
                     ],
+                    withdrawals: None,
                 }
             ]),
         };
@@ -499,8 +478,10 @@ mod test {
     hex!("0000000000000000000000000000000000000000000000000000000000000000").into(),
                             nonce: 0x0000000000000000u64,
                             base_fee_per_gas: None,
+                            withdrawals_root: None,
                         },
                     ],
+                    withdrawals: None,
                 }
             ]),
         };

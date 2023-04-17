@@ -5,7 +5,6 @@ use crate::{
     table::{Decode, Encode},
     Error,
 };
-use bytes::Bytes;
 use reth_codecs::Compact;
 use reth_primitives::{Account, Address, TransitionId};
 use serde::{Deserialize, Serialize};
@@ -25,7 +24,10 @@ pub struct AccountBeforeTx {
 // and compress second part of the value. If we have compression
 // over whole value (Even SubKey) that would mess up fetching of values with seek_by_key_subkey
 impl Compact for AccountBeforeTx {
-    fn to_compact(self, buf: &mut impl bytes::BufMut) -> usize {
+    fn to_compact<B>(self, buf: &mut B) -> usize
+    where
+        B: bytes::BufMut + AsMut<[u8]>,
+    {
         // for now put full bytes and later compress it.
         buf.put_slice(&self.address.to_fixed_bytes()[..]);
         self.info.to_compact(buf) + 32
@@ -87,12 +89,10 @@ impl Encode for TransitionIdAddress {
 }
 
 impl Decode for TransitionIdAddress {
-    fn decode<B: Into<Bytes>>(value: B) -> Result<Self, Error> {
-        let value: bytes::Bytes = value.into();
-
-        let num =
-            u64::from_be_bytes(value.as_ref()[..8].try_into().map_err(|_| Error::DecodeError)?);
-        let hash = Address::from_slice(&value.slice(8..));
+    fn decode<B: AsRef<[u8]>>(value: B) -> Result<Self, Error> {
+        let value = value.as_ref();
+        let num = u64::from_be_bytes(value[..8].try_into().map_err(|_| Error::DecodeError)?);
+        let hash = Address::from_slice(&value[8..]);
 
         Ok(TransitionIdAddress((num, hash)))
     }
@@ -116,10 +116,10 @@ mod test {
         bytes[..8].copy_from_slice(&num.to_be_bytes());
         bytes[8..].copy_from_slice(&hash.0);
 
-        let encoded = Encode::encode(key.clone());
+        let encoded = Encode::encode(key);
         assert_eq!(encoded, bytes);
 
-        let decoded: TransitionIdAddress = Decode::decode(encoded.to_vec()).unwrap();
+        let decoded: TransitionIdAddress = Decode::decode(encoded).unwrap();
         assert_eq!(decoded, key);
     }
 

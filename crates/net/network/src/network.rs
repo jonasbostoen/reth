@@ -11,9 +11,10 @@ use reth_interfaces::{
 };
 use reth_net_common::bandwidth_meter::BandwidthMeter;
 use reth_network_api::{
-    NetworkError, NetworkInfo, NetworkStatus, PeerKind, Peers, PeersInfo, ReputationChangeKind,
+    NetworkError, NetworkInfo, PeerKind, Peers, PeersInfo, ReputationChangeKind,
 };
-use reth_primitives::{Head, NodeRecord, PeerId, TransactionSigned, TxHash, H256};
+use reth_primitives::{Head, NodeRecord, PeerId, TransactionSigned, H256};
+use reth_rpc_types::NetworkStatus;
 use std::{
     net::SocketAddr,
     sync::{
@@ -141,11 +142,8 @@ impl NetworkHandle {
     }
 
     /// Send transactions hashes to the peer.
-    pub fn send_transactions_hashes(&self, peer_id: PeerId, msg: Vec<TxHash>) {
-        self.send_message(NetworkHandleMessage::SendPooledTransactionHashes {
-            peer_id,
-            msg: NewPooledTransactionHashes(msg),
-        })
+    pub fn send_transactions_hashes(&self, peer_id: PeerId, msg: NewPooledTransactionHashes) {
+        self.send_message(NetworkHandleMessage::SendPooledTransactionHashes { peer_id, msg })
     }
 
     /// Send full transactions to the peer
@@ -232,6 +230,10 @@ impl NetworkInfo for NetworkHandle {
     fn chain_id(&self) -> u64 {
         self.inner.chain_id.load(Ordering::Relaxed)
     }
+
+    fn is_syncing(&self) -> bool {
+        SyncStateProvider::is_syncing(self)
+    }
 }
 
 impl StatusUpdater for NetworkHandle {
@@ -306,7 +308,7 @@ pub(crate) enum NetworkHandleMessage {
     FetchClient(oneshot::Sender<FetchClient>),
     /// Apply a status update.
     StatusUpdate { head: Head },
-    /// Get the currenet status
+    /// Get the current status
     GetStatus(oneshot::Sender<NetworkStatus>),
     /// Get PeerInfo from all the peers
     GetPeerInfo(oneshot::Sender<Vec<PeerInfo>>),

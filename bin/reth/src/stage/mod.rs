@@ -2,12 +2,12 @@
 //!
 //! Stage debugging tool
 use crate::{
-    args::NetworkArgs,
-    dirs::{ConfigPath, DbPath, PlatformPath},
-    prometheus_exporter,
+    args::{get_secret_key, NetworkArgs},
+    dirs::{ConfigPath, DbPath, MaybePlatformPath, PlatformPath, SecretKeyPath},
+    prometheus_exporter, StageEnum,
 };
-use clap::{Parser, ValueEnum};
-use reth_consensus::beacon::BeaconConsensus;
+use clap::Parser;
+use reth_beacon_consensus::BeaconConsensus;
 use reth_downloaders::bodies::bodies::BodiesDownloaderBuilder;
 use reth_primitives::ChainSpec;
 use reth_provider::{ShareableDatabase, Transaction};
@@ -16,7 +16,7 @@ use reth_staged_sync::{
     Config,
 };
 use reth_stages::{
-    stages::{BodyStage, ExecutionStage, SenderRecoveryStage},
+    stages::{BodyStage, ExecutionStage, SenderRecoveryStage, TransactionLookupStage},
     ExecInput, Stage, StageId, UnwindInput,
 };
 use std::{net::SocketAddr, sync::Arc};
@@ -33,11 +33,11 @@ pub struct Command {
     /// - Windows: `{FOLDERID_RoamingAppData}/reth/db`
     /// - macOS: `$HOME/Library/Application Support/reth/db`
     #[arg(long, value_name = "PATH", verbatim_doc_comment, default_value_t)]
-    db: PlatformPath<DbPath>,
+    db: MaybePlatformPath<DbPath>,
 
     /// The path to the configuration file to use.
     #[arg(long, value_name = "FILE", verbatim_doc_comment, default_value_t)]
-    config: PlatformPath<ConfigPath>,
+    config: MaybePlatformPath<ConfigPath>,
 
     /// The chain this node is running.
     ///
@@ -54,7 +54,13 @@ pub struct Command {
         default_value = "mainnet",
         value_parser = chain_spec_value_parser
     )]
-    chain: ChainSpec,
+    chain: Arc<ChainSpec>,
+
+    /// Secret key to use for this node.
+    ///
+    /// This also will deterministically set the peer ID.
+    #[arg(long, value_name = "PATH", global = true, required = false, default_value_t)]
+    p2p_secret_key: PlatformPath<SecretKeyPath>,
 
     /// Enable Prometheus metrics.
     ///
@@ -86,14 +92,6 @@ pub struct Command {
     network: NetworkArgs,
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq, PartialOrd, Ord, ValueEnum)]
-enum StageEnum {
-    Headers,
-    Bodies,
-    Senders,
-    Execution,
-}
-
 impl Command {
     /// Execute `stage` command
     pub async fn execute(&self) -> eyre::Result<()> {
@@ -101,12 +99,9 @@ impl Command {
         // Does not do anything on windows.
         fdlimit::raise_fd_limit();
 
-        if let Some(listen_addr) = self.metrics {
-            info!(target: "reth::cli", "Starting metrics endpoint at {}", listen_addr);
-            prometheus_exporter::initialize(listen_addr)?;
-        }
-
-        let config: Config = confy::load_path(&self.config).unwrap_or_default();
+        let config: Config =
+            confy::load_path(self.config.unwrap_or_chain_default(self.chain.chain))
+                .unwrap_or_default();
         info!(target: "reth::cli", "reth {} starting stage {:?}", clap::crate_version!(), self.stage);
 
         let input = ExecInput {
@@ -116,14 +111,22 @@ impl Command {
 
         let unwind = UnwindInput { stage_progress: self.to, unwind_to: self.from, bad_block: None };
 
-        let db = Arc::new(init_db(&self.db)?);
+        // add network name to db directory
+        let db_path = self.db.unwrap_or_chain_default(self.chain.chain);
+
+        let db = Arc::new(init_db(db_path)?);
         let mut tx = Transaction::new(db.as_ref())?;
+
+        if let Some(listen_addr) = self.metrics {
+            info!(target: "reth::cli", "Starting metrics endpoint at {}", listen_addr);
+            prometheus_exporter::initialize_with_db_metrics(listen_addr, Arc::clone(&db)).await?;
+        }
 
         let num_blocks = self.to - self.from + 1;
 
         match self.stage {
             StageEnum::Bodies => {
-                let (consensus, _) = BeaconConsensus::builder().build(self.chain.clone());
+                let consensus = Arc::new(BeaconConsensus::new(self.chain.clone()));
 
                 let mut config = config;
                 config.peers.connect_trusted_nodes_only = self.network.trusted_only;
@@ -133,10 +136,12 @@ impl Command {
                     });
                 }
 
+                let p2p_secret_key = get_secret_key(&self.p2p_secret_key)?;
+
                 let network = self
                     .network
-                    .network_config(&config, self.chain.clone())
-                    .build(Arc::new(ShareableDatabase::new(db.clone())))
+                    .network_config(&config, self.chain.clone(), p2p_secret_key)
+                    .build(Arc::new(ShareableDatabase::new(db.clone(), self.chain.clone())))
                     .start_network()
                     .await?;
                 let fetch_client = Arc::new(network.fetch_client().await?);
@@ -171,11 +176,21 @@ impl Command {
                 stage.execute(&mut tx, input).await?;
             }
             StageEnum::Execution => {
-                let mut stage =
-                    ExecutionStage { chain_spec: self.chain.clone(), commit_threshold: num_blocks };
+                let factory = reth_revm::Factory::new(self.chain.clone());
+                let mut stage = ExecutionStage::new(factory, num_blocks);
                 if !self.skip_unwind {
                     stage.unwind(&mut tx, unwind).await?;
                 }
+                stage.execute(&mut tx, input).await?;
+            }
+            StageEnum::TxLookup => {
+                let mut stage = TransactionLookupStage::new(num_blocks);
+
+                // Unwind first
+                if !self.skip_unwind {
+                    stage.unwind(&mut tx, unwind).await?;
+                }
+
                 stage.execute(&mut tx, input).await?;
             }
             _ => {}

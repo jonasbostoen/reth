@@ -1,6 +1,7 @@
 //! Code generator for the `Compact` trait.
 
 use super::*;
+use convert_case::{Case, Casing};
 
 /// Generates code to implement the `Compact` trait for a data type.
 pub fn generate_from_to(ident: &Ident, fields: &FieldList) -> TokenStream2 {
@@ -9,8 +10,10 @@ pub fn generate_from_to(ident: &Ident, fields: &FieldList) -> TokenStream2 {
     let to_compact = generate_to_compact(fields, ident);
     let from_compact = generate_from_compact(fields, ident);
 
-    let fuzz = format_ident!("fuzz_test_{ident}");
-    let test = format_ident!("fuzz_{ident}");
+    let snake_case_ident = ident.to_string().to_case(Case::Snake);
+
+    let fuzz = format_ident!("fuzz_test_{snake_case_ident}");
+    let test = format_ident!("fuzz_{snake_case_ident}");
 
     // Build function
     quote! {
@@ -31,7 +34,7 @@ pub fn generate_from_to(ident: &Ident, fields: &FieldList) -> TokenStream2 {
         }
 
         impl Compact for #ident {
-            fn to_compact(self, buf: &mut impl bytes::BufMut) -> usize {
+            fn to_compact<B>(self, buf: &mut B) -> usize where B: bytes::BufMut + AsMut<[u8]> {
                 let mut flags = #flags::default();
                 let mut total_len = 0;
                 #(#to_compact)*

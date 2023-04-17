@@ -22,7 +22,7 @@ pub enum JwtError {
     InvalidSignature,
     #[error("The iat (issued-at) claim is not within +-60 seconds from the current time")]
     InvalidIssuanceTimestamp,
-    #[error("Autorization header is missing or invalid")]
+    #[error("Authorization header is missing or invalid")]
     MissingOrInvalidAuthorizationHeader,
     #[error("JWT decoding error {0}")]
     JwtDecodingError(String),
@@ -58,8 +58,10 @@ impl JwtSecret {
     /// Returns an error if one of the following applies:
     /// - `hex` is not a valid hexadecimal string
     /// - `hex` argument length is less than `JWT_SECRET_LEN`
+    ///
+    /// This strips the leading `0x`, if any.
     pub fn from_hex<S: AsRef<str>>(hex: S) -> Result<Self, JwtError> {
-        let hex: &str = hex.as_ref().trim();
+        let hex: &str = hex.as_ref().trim().trim_start_matches("0x");
         if hex.len() != JWT_SECRET_LEN {
             Err(JwtError::InvalidLength(JWT_SECRET_LEN, hex.len()))
         } else {
@@ -109,7 +111,9 @@ impl JwtSecret {
     ///
     /// See also: [JWT Claims - Engine API specs](https://github.com/ethereum/execution-apis/blob/main/src/engine/authentication.md#jwt-claims)
     pub fn validate(&self, jwt: String) -> Result<(), JwtError> {
-        let validation = Validation::new(JWT_SIGNATURE_ALGO);
+        let mut validation = Validation::new(JWT_SIGNATURE_ALGO);
+        // ensure that the JWT has an `iat` claim
+        validation.set_required_spec_claims(&["iat"]);
         let bytes = &self.0;
 
         match decode::<Claims>(&jwt, &DecodingKey::from_secret(bytes), &validation) {
@@ -139,12 +143,24 @@ impl JwtSecret {
         JwtSecret::from_hex(secret).unwrap()
     }
 
-    #[cfg(test)]
-    pub(crate) fn encode(&self, claims: &Claims) -> Result<String, Box<dyn std::error::Error>> {
+    /// Encode the header and claims given and sign the payload using the algorithm from the header
+    /// and the key.
+    ///
+    /// ```rust
+    /// use reth_rpc::{Claims, JwtSecret};
+    ///
+    /// let my_claims = Claims {
+    ///     iat: 0,
+    ///     exp: None
+    /// };
+    /// let secret = JwtSecret::random();
+    /// let token = secret.encode(&my_claims).unwrap();
+    /// ```
+    pub fn encode(&self, claims: &Claims) -> Result<String, jsonwebtoken::errors::Error> {
         let bytes = &self.0;
         let key = jsonwebtoken::EncodingKey::from_secret(bytes);
         let algo = jsonwebtoken::Header::new(Algorithm::HS256);
-        Ok(jsonwebtoken::encode(&algo, claims, &key)?)
+        jsonwebtoken::encode(&algo, claims, &key)
     }
 }
 
@@ -156,14 +172,15 @@ impl JwtSecret {
 /// The Engine API spec requires that just the `iat` (issued-at) claim is provided.
 /// It ignores claims that are optional or additional for this specification.
 #[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct Claims {
+pub struct Claims {
     /// The "iat" value MUST be a number containing a NumericDate value.
     /// According to the RFC A NumericDate represents the number of seconds since
     /// the UNIX_EPOCH.
     /// - [`RFC-7519 - Spec`](https://www.rfc-editor.org/rfc/rfc7519#section-4.1.6)
     /// - [`RFC-7519 - Notations`](https://www.rfc-editor.org/rfc/rfc7519#section-2)
-    pub(crate) iat: u64,
-    pub(crate) exp: u64,
+    pub iat: u64,
+    /// Expiration, if any
+    pub exp: Option<u64>,
 }
 
 impl Claims {
@@ -213,6 +230,14 @@ mod tests {
     }
 
     #[test]
+    fn creation_ok_hex_string_with_0x() {
+        let hex: String =
+            "0x7365637265747365637265747365637265747365637265747365637265747365".into();
+        let result = JwtSecret::from_hex(hex);
+        assert!(matches!(result, Ok(_)));
+    }
+
+    #[test]
     fn creation_error_wrong_len() {
         let hex = "f79ae8046";
         let result = JwtSecret::from_hex(hex);
@@ -229,7 +254,7 @@ mod tests {
     #[test]
     fn validation_ok() {
         let secret = JwtSecret::random();
-        let claims = Claims { iat: to_u64(SystemTime::now()), exp: 10000000000 };
+        let claims = Claims { iat: to_u64(SystemTime::now()), exp: Some(10000000000) };
         let jwt: String = secret.encode(&claims).unwrap();
 
         let result = secret.validate(jwt);
@@ -244,7 +269,7 @@ mod tests {
         // Check past 'iat' claim more than 60 secs
         let offset = Duration::from_secs(JWT_MAX_IAT_DIFF.as_secs() + 1);
         let out_of_window_time = SystemTime::now().checked_sub(offset).unwrap();
-        let claims = Claims { iat: to_u64(out_of_window_time), exp: 10000000000 };
+        let claims = Claims { iat: to_u64(out_of_window_time), exp: Some(10000000000) };
         let jwt: String = secret.encode(&claims).unwrap();
 
         let result = secret.validate(jwt);
@@ -254,7 +279,7 @@ mod tests {
         // Check future 'iat' claim more than 60 secs
         let offset = Duration::from_secs(JWT_MAX_IAT_DIFF.as_secs() + 1);
         let out_of_window_time = SystemTime::now().checked_add(offset).unwrap();
-        let claims = Claims { iat: to_u64(out_of_window_time), exp: 10000000000 };
+        let claims = Claims { iat: to_u64(out_of_window_time), exp: Some(10000000000) };
         let jwt: String = secret.encode(&claims).unwrap();
 
         let result = secret.validate(jwt);
@@ -265,7 +290,7 @@ mod tests {
     #[test]
     fn validation_error_wrong_signature() {
         let secret_1 = JwtSecret::random();
-        let claims = Claims { iat: to_u64(SystemTime::now()), exp: 10000000000 };
+        let claims = Claims { iat: to_u64(SystemTime::now()), exp: Some(10000000000) };
         let jwt: String = secret_1.encode(&claims).unwrap();
 
         // A different secret will generate a different signature.
@@ -282,11 +307,23 @@ mod tests {
         let key = EncodingKey::from_secret(bytes);
         let unsupported_algo = Header::new(Algorithm::HS384);
 
-        let claims = Claims { iat: to_u64(SystemTime::now()), exp: 10000000000 };
+        let claims = Claims { iat: to_u64(SystemTime::now()), exp: Some(10000000000) };
         let jwt: String = encode(&unsupported_algo, &claims, &key).unwrap();
         let result = secret.validate(jwt);
 
         assert!(matches!(result, Err(JwtError::UnsupportedSignatureAlgorithm)));
+    }
+
+    #[test]
+    fn valid_without_exp_claim() {
+        let secret = JwtSecret::random();
+
+        let claims = Claims { iat: to_u64(SystemTime::now()), exp: None };
+        let jwt: String = secret.encode(&claims).unwrap();
+
+        let result = secret.validate(jwt);
+
+        assert!(matches!(result, Ok(())));
     }
 
     #[test]

@@ -1,12 +1,18 @@
 //! Transaction validation abstractions.
 
 use crate::{
-    error::PoolError,
+    error::InvalidPoolTransactionError,
     identifier::{SenderId, TransactionId},
     traits::{PoolTransaction, TransactionOrigin},
+    MAX_INIT_CODE_SIZE, TX_MAX_SIZE,
 };
-use reth_primitives::{Address, TransactionKind, TxHash, U256};
-use std::{fmt, time::Instant};
+use reth_primitives::{
+    Address, ChainSpec, IntoRecoveredTransaction, InvalidTransactionError, TransactionKind,
+    TransactionSignedEcRecovered, TxHash, EIP1559_TX_TYPE_ID, EIP2930_TX_TYPE_ID,
+    LEGACY_TX_TYPE_ID, U256,
+};
+use reth_provider::{AccountProvider, StateProviderFactory};
+use std::{fmt, marker::PhantomData, sync::Arc, time::Instant};
 
 /// A Result type returned after checking a transaction's validity.
 #[derive(Debug)]
@@ -22,7 +28,9 @@ pub enum TransactionValidationOutcome<T: PoolTransaction> {
     },
     /// The transaction is considered invalid indefinitely: It violates constraints that prevent
     /// this transaction from ever becoming valid.
-    Invalid(T, PoolError),
+    Invalid(T, InvalidPoolTransactionError),
+    /// An error occurred while trying to validate the transaction
+    Error(T, Box<dyn std::error::Error + Send + Sync>),
 }
 
 /// Provides support for validating transaction at any given state of the chain
@@ -59,23 +67,212 @@ pub trait TransactionValidator: Send + Sync {
     /// `max_init_code_size` should be configurable so this will take it as an argument.
     fn ensure_max_init_code_size(
         &self,
-        transaction: Self::Transaction,
+        transaction: &Self::Transaction,
         max_init_code_size: usize,
-    ) -> Result<(), PoolError> {
-        // TODO check whether we are in the Shanghai stage.
-        // if !self.shanghai {
-        //     return Ok(())
-        // }
-
+    ) -> Result<(), InvalidPoolTransactionError> {
         if *transaction.kind() == TransactionKind::Create && transaction.size() > max_init_code_size
         {
-            Err(PoolError::TxExceedsMaxInitCodeSize(
-                *transaction.hash(),
+            Err(InvalidPoolTransactionError::ExceedsMaxInitCodeSize(
                 transaction.size(),
                 max_init_code_size,
             ))
         } else {
             Ok(())
+        }
+    }
+}
+
+/// A [TransactionValidator] implementation that validates ethereum transaction.
+#[derive(Debug, Clone)]
+pub struct EthTransactionValidator<Client, T> {
+    /// Spec of the chain
+    chain_spec: Arc<ChainSpec>,
+    /// This type fetches account info from the db
+    client: Client,
+    /// Fork indicator whether we are in the Shanghai stage.
+    shanghai: bool,
+    /// Fork indicator whether we are using EIP-2718 type transactions.
+    eip2718: bool,
+    /// Fork indicator whether we are using EIP-1559 type transactions.
+    eip1559: bool,
+    /// The current max gas limit
+    block_gas_limit: u64,
+    /// Minimum priority fee to enforce for acceptance into the pool.
+    minimum_priority_fee: Option<u128>,
+    /// Marker for the transaction type
+    _marker: PhantomData<T>,
+}
+
+// === impl EthTransactionValidator ===
+
+impl<Client, Tx> EthTransactionValidator<Client, Tx> {
+    /// Creates a new instance for the given [ChainSpec]
+    pub fn new(client: Client, chain_spec: Arc<ChainSpec>) -> Self {
+        // TODO(mattsse): improve these settings by checking against hardfork
+        // See [reth_consensus::validation::validate_transaction_regarding_header]
+        Self {
+            chain_spec,
+            client,
+            shanghai: true,
+            eip2718: true,
+            eip1559: true,
+            block_gas_limit: 30_000_000,
+            minimum_priority_fee: None,
+            _marker: Default::default(),
+        }
+    }
+
+    /// Returns the configured chain id
+    pub fn chain_id(&self) -> u64 {
+        self.chain_spec.chain().id()
+    }
+}
+
+#[async_trait::async_trait]
+impl<Client, Tx> TransactionValidator for EthTransactionValidator<Client, Tx>
+where
+    Client: StateProviderFactory,
+    Tx: PoolTransaction,
+{
+    type Transaction = Tx;
+
+    async fn validate_transaction(
+        &self,
+        origin: TransactionOrigin,
+        transaction: Self::Transaction,
+    ) -> TransactionValidationOutcome<Self::Transaction> {
+        // Checks for tx_type
+        match transaction.tx_type() {
+            LEGACY_TX_TYPE_ID => {
+                // Accept legacy transactions
+            }
+            EIP2930_TX_TYPE_ID => {
+                // Accept only legacy transactions until EIP-2718/2930 activates
+                if !self.eip2718 {
+                    return TransactionValidationOutcome::Invalid(
+                        transaction,
+                        InvalidTransactionError::Eip1559Disabled.into(),
+                    )
+                }
+            }
+
+            EIP1559_TX_TYPE_ID => {
+                // Reject dynamic fee transactions until EIP-1559 activates.
+                if !self.eip1559 {
+                    return TransactionValidationOutcome::Invalid(
+                        transaction,
+                        InvalidTransactionError::Eip1559Disabled.into(),
+                    )
+                }
+            }
+
+            _ => {
+                return TransactionValidationOutcome::Invalid(
+                    transaction,
+                    InvalidTransactionError::TxTypeNotSupported.into(),
+                )
+            }
+        };
+
+        // Reject transactions over defined size to prevent DOS attacks
+        if transaction.size() > TX_MAX_SIZE {
+            let size = transaction.size();
+            return TransactionValidationOutcome::Invalid(
+                transaction,
+                InvalidPoolTransactionError::OversizedData(size, TX_MAX_SIZE),
+            )
+        }
+
+        // Check whether the init code size has been exceeded.
+        if self.shanghai {
+            if let Err(err) = self.ensure_max_init_code_size(&transaction, MAX_INIT_CODE_SIZE) {
+                return TransactionValidationOutcome::Invalid(transaction, err)
+            }
+        }
+
+        // Checks for gas limit
+        if transaction.gas_limit() > self.block_gas_limit {
+            let gas_limit = transaction.gas_limit();
+            return TransactionValidationOutcome::Invalid(
+                transaction,
+                InvalidPoolTransactionError::ExceedsGasLimit(gas_limit, self.block_gas_limit),
+            )
+        }
+
+        // Ensure max_priority_fee_per_gas (if EIP1559) is less than max_fee_per_gas if any.
+        if transaction.max_priority_fee_per_gas() > transaction.max_fee_per_gas() {
+            return TransactionValidationOutcome::Invalid(
+                transaction,
+                InvalidTransactionError::TipAboveFeeCap.into(),
+            )
+        }
+
+        // Drop non-local transactions with a fee lower than the configured fee for acceptance into
+        // the pool.
+        if !origin.is_local() &&
+            transaction.is_eip1559() &&
+            transaction.max_priority_fee_per_gas() < self.minimum_priority_fee
+        {
+            return TransactionValidationOutcome::Invalid(
+                transaction,
+                InvalidPoolTransactionError::Underpriced,
+            )
+        }
+
+        // Checks for chainid
+        if let Some(chain_id) = transaction.chain_id() {
+            if chain_id != self.chain_id() {
+                return TransactionValidationOutcome::Invalid(
+                    transaction,
+                    InvalidTransactionError::ChainIdMismatch.into(),
+                )
+            }
+        }
+
+        let account = match self
+            .client
+            .latest()
+            .and_then(|state| state.basic_account(transaction.sender()))
+        {
+            Ok(account) => account.unwrap_or_default(),
+            Err(err) => return TransactionValidationOutcome::Error(transaction, Box::new(err)),
+        };
+
+        // Signer account shouldn't have bytecode. Presence of bytecode means this is a
+        // smartcontract.
+        if account.has_bytecode() {
+            return TransactionValidationOutcome::Invalid(
+                transaction,
+                InvalidTransactionError::SignerAccountHasBytecode.into(),
+            )
+        }
+
+        // Checks for nonce
+        if transaction.nonce() < account.nonce {
+            return TransactionValidationOutcome::Invalid(
+                transaction,
+                InvalidTransactionError::NonceNotConsistent.into(),
+            )
+        }
+
+        // Checks for max cost
+        if transaction.cost() > account.balance {
+            let cost = transaction.cost();
+            return TransactionValidationOutcome::Invalid(
+                transaction,
+                InvalidTransactionError::InsufficientFunds {
+                    cost,
+                    available_funds: account.balance,
+                }
+                .into(),
+            )
+        }
+
+        // Return the valid transaction
+        TransactionValidationOutcome::Valid {
+            balance: account.balance,
+            state_nonce: account.nonce,
+            transaction,
         }
     }
 }
@@ -94,6 +291,8 @@ pub struct ValidPoolTransaction<T: PoolTransaction> {
     pub timestamp: Instant,
     /// Where this transaction originated from.
     pub origin: TransactionOrigin,
+    /// The length of the rlp encoded transaction (cached)
+    pub encoded_length: usize,
 }
 
 // === impl ValidPoolTransaction ===
@@ -102,6 +301,11 @@ impl<T: PoolTransaction> ValidPoolTransaction<T> {
     /// Returns the hash of the transaction.
     pub fn hash(&self) -> &TxHash {
         self.transaction.hash()
+    }
+
+    /// Returns the type identifier of the transaction
+    pub fn tx_type(&self) -> u8 {
+        self.transaction.tx_type()
     }
 
     /// Returns the address of the sender
@@ -150,6 +354,12 @@ impl<T: PoolTransaction> ValidPoolTransaction<T> {
     }
 }
 
+impl<T: PoolTransaction> IntoRecoveredTransaction for ValidPoolTransaction<T> {
+    fn to_recovered_transaction(&self) -> TransactionSignedEcRecovered {
+        self.transaction.to_recovered_transaction()
+    }
+}
+
 #[cfg(test)]
 impl<T: PoolTransaction + Clone> Clone for ValidPoolTransaction<T> {
     fn clone(&self) -> Self {
@@ -160,6 +370,7 @@ impl<T: PoolTransaction + Clone> Clone for ValidPoolTransaction<T> {
             cost: self.cost,
             timestamp: self.timestamp,
             origin: self.origin,
+            encoded_length: self.encoded_length,
         }
     }
 }

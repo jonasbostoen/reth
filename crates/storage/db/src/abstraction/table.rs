@@ -3,7 +3,7 @@ use crate::{
     transaction::{DbTx, DbTxMut},
     Error,
 };
-use bytes::Bytes;
+
 use serde::Serialize;
 use std::{
     fmt::Debug,
@@ -13,16 +13,28 @@ use std::{
 /// Trait that will transform the data to be saved in the DB in a (ideally) compressed format
 pub trait Compress: Send + Sync + Sized + Debug {
     /// Compressed type.
-    type Compressed: AsRef<[u8]> + Send + Sync;
+    type Compressed: bytes::BufMut + AsMut<[u8]> + Default + AsRef<[u8]> + Send + Sync;
+
+    /// If the type cannot be compressed, return its inner reference as `Some(self.as_ref())`
+    fn uncompressable_ref(&self) -> Option<&[u8]> {
+        None
+    }
 
     /// Compresses data going into the database.
-    fn compress(self) -> Self::Compressed;
+    fn compress(self) -> Self::Compressed {
+        let mut buf = Self::Compressed::default();
+        self.compress_to_buf(&mut buf);
+        buf
+    }
+
+    /// Compresses data to a given buffer.
+    fn compress_to_buf<B: bytes::BufMut + AsMut<[u8]>>(self, buf: &mut B);
 }
 
 /// Trait that will transform the data to be read from the DB.
 pub trait Decompress: Send + Sync + Sized + Debug {
     /// Decompresses data coming from the database.
-    fn decompress<B: Into<Bytes>>(value: B) -> Result<Self, Error>;
+    fn decompress<B: AsRef<[u8]>>(value: B) -> Result<Self, Error>;
 }
 
 /// Trait that will transform the data to be saved in the DB.
@@ -37,7 +49,7 @@ pub trait Encode: Send + Sync + Sized + Debug {
 /// Trait that will transform the data to be read from the DB.
 pub trait Decode: Send + Sync + Sized + Debug {
     /// Decodes data coming from the database.
-    fn decode<B: Into<Bytes>>(value: B) -> Result<Self, Error>;
+    fn decode<B: AsRef<[u8]>>(key: B) -> Result<Self, Error>;
 }
 
 /// Generic trait that enforces the database key to implement [`Encode`] and [`Decode`].
@@ -56,7 +68,7 @@ impl<T> Value for T where T: Compress + Decompress + Serialize {}
 /// [`Decode`] when appropriate. These traits define how the data is stored and read from the
 /// database.
 ///
-/// It allows for the use of codecs. See [`crate::models::BlockNumHash`] for a custom
+/// It allows for the use of codecs. See [`crate::models::ShardedKey`] for a custom
 /// implementation.
 pub trait Table: Send + Sync + Debug + 'static {
     /// Return table name as it is present inside the MDBX.
@@ -101,19 +113,20 @@ pub trait TableImporter<'tx>: for<'a> DbTxMut<'a> {
         source_tx: &R,
         from: Option<<T as Table>::Key>,
         to: <T as Table>::Key,
-    ) -> Result<(), Error> {
+    ) -> Result<(), Error>
+    where
+        T::Key: Default,
+    {
         let mut destination_cursor = self.cursor_write::<T>()?;
         let mut source_cursor = source_tx.cursor_read::<T>()?;
 
-        for row in source_cursor.walk(from)? {
+        let source_range = match from {
+            Some(from) => source_cursor.walk_range(from..=to),
+            None => source_cursor.walk_range(..=to),
+        };
+        for row in source_range? {
             let (key, value) = row?;
-            let finished = key == to;
-
             destination_cursor.append(key, value)?;
-
-            if finished {
-                break
-            }
         }
 
         Ok(())

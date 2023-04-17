@@ -1,19 +1,18 @@
 //! Database debugging tool
-use crate::dirs::{DbPath, PlatformPath};
+use std::sync::Arc;
+
+use crate::{
+    dirs::{DbPath, MaybePlatformPath},
+    utils::DbTool,
+};
 use clap::{Parser, Subcommand};
 use comfy_table::{Cell, Row, Table as ComfyTable};
-use eyre::{Result, WrapErr};
-use reth_db::{
-    cursor::{DbCursorRO, Walker},
-    database::Database,
-    table::Table,
-    tables,
-    transaction::DbTx,
-};
-use reth_interfaces::test_utils::generators::random_block_range;
-use reth_provider::insert_canonical_block;
-use std::collections::BTreeMap;
-use tracing::{error, info};
+use eyre::WrapErr;
+use human_bytes::human_bytes;
+use reth_db::{database::Database, tables};
+use reth_primitives::ChainSpec;
+use reth_staged_sync::utils::chainspec::genesis_value_parser;
+use tracing::error;
 
 /// DB List TUI
 mod tui;
@@ -28,8 +27,25 @@ pub struct Command {
     /// - Linux: `$XDG_DATA_HOME/reth/db` or `$HOME/.local/share/reth/db`
     /// - Windows: `{FOLDERID_RoamingAppData}/reth/db`
     /// - macOS: `$HOME/Library/Application Support/reth/db`
-    #[arg(long, value_name = "PATH", verbatim_doc_comment, default_value_t)]
-    db: PlatformPath<DbPath>,
+    #[arg(global = true, long, value_name = "PATH", verbatim_doc_comment, default_value_t)]
+    db: MaybePlatformPath<DbPath>,
+
+    /// The chain this node is running.
+    ///
+    /// Possible values are either a built-in chain or the path to a chain specification file.
+    ///
+    /// Built-in chains:
+    /// - mainnet
+    /// - goerli
+    /// - sepolia
+    #[arg(
+        long,
+        value_name = "CHAIN_OR_PATH",
+        verbatim_doc_comment,
+        default_value = "mainnet",
+        value_parser = genesis_value_parser
+    )]
+    chain: Arc<ChainSpec>,
 
     #[clap(subcommand)]
     command: Subcommands,
@@ -70,11 +86,14 @@ pub struct ListArgs {
 impl Command {
     /// Execute `db` command
     pub async fn execute(&self) -> eyre::Result<()> {
-        std::fs::create_dir_all(&self.db)?;
+        // add network name to db directory
+        let db_path = self.db.unwrap_or_chain_default(self.chain.chain);
+
+        std::fs::create_dir_all(&db_path)?;
 
         // TODO: Auto-impl for Database trait
         let db = reth_db::mdbx::Env::<reth_db::mdbx::WriteMap>::open(
-            self.db.as_ref(),
+            db_path.as_ref(),
             reth_db::mdbx::EnvKind::RW,
         )?;
 
@@ -91,7 +110,7 @@ impl Command {
                     "Branch Pages",
                     "Leaf Pages",
                     "Overflow Pages",
-                    "Total Size (KB)",
+                    "Total Size",
                 ]);
 
                 tool.db.view(|tx| {
@@ -120,7 +139,7 @@ impl Command {
                             .add_cell(Cell::new(branch_pages))
                             .add_cell(Cell::new(leaf_pages))
                             .add_cell(Cell::new(overflow_pages))
-                            .add_cell(Cell::new(table_size / 1024));
+                            .add_cell(Cell::new(human_bytes(table_size as f64)));
                         stats_table.add_row(row);
                     }
                     Ok::<(), eyre::Report>(())
@@ -150,8 +169,10 @@ impl Command {
                                         );
                                         return Ok(());
                                     }
-                                    let map = tool.list::<tables::$table>($start, $len)?;
-                                    tui::DbListTUI::<tables::$table>::show_tui(map, $start, total_entries)
+
+                                    tui::DbListTUI::<_, tables::$table>::new(|start, count| {
+                                        tool.list::<tables::$table>(start, count).unwrap()
+                                    }, $start, $len, total_entries).run()
                                 })??
                             },)*
                             _ => {
@@ -167,75 +188,34 @@ impl Command {
                     HeaderTD,
                     HeaderNumbers,
                     Headers,
-                    BlockBodies,
+                    BlockBodyIndices,
                     BlockOmmers,
+                    BlockWithdrawals,
+                    TransactionBlock,
+                    Transactions,
                     TxHashNumber,
+                    Receipts,
                     PlainStorageState,
                     PlainAccountState,
-                    BlockTransitionIndex,
-                    TxTransitionIndex,
+                    Bytecodes,
+                    AccountHistory,
+                    StorageHistory,
+                    AccountChangeSet,
+                    StorageChangeSet,
+                    HashedAccount,
+                    HashedStorage,
+                    AccountsTrie,
+                    StoragesTrie,
+                    TxSenders,
                     SyncStage,
-                    TxHashNumber,
-                    Transactions
+                    SyncStageProgress
                 ]);
             }
             Subcommands::Drop => {
-                tool.drop(&self.db)?;
+                tool.drop(self.db.unwrap_or_chain_default(self.chain.chain))?;
             }
         }
 
-        Ok(())
-    }
-}
-
-/// Wrapper over DB that implements many useful DB queries.
-pub(crate) struct DbTool<'a, DB: Database> {
-    pub(crate) db: &'a DB,
-}
-
-impl<'a, DB: Database> DbTool<'a, DB> {
-    /// Takes a DB where the tables have already been created.
-    pub(crate) fn new(db: &'a DB) -> eyre::Result<Self> {
-        Ok(Self { db })
-    }
-
-    /// Seeds the database with some random data, only used for testing
-    fn seed(&mut self, len: u64) -> Result<()> {
-        info!(target: "reth::cli", "Generating random block range from 0 to {len}");
-        let chain = random_block_range(0..len, Default::default(), 0..64);
-
-        self.db.update(|tx| {
-            chain.iter().try_for_each(|block| {
-                insert_canonical_block(tx, block, true)?;
-                Ok::<_, eyre::Error>(())
-            })
-        })??;
-
-        info!(target: "reth::cli", "Database seeded with {len} blocks");
-        Ok(())
-    }
-
-    /// Grabs the contents of the table within a certain index range and places the
-    /// entries into a [`HashMap`][std::collections::HashMap].
-    fn list<T: Table>(&mut self, start: usize, len: usize) -> Result<BTreeMap<T::Key, T::Value>> {
-        let data = self.db.view(|tx| {
-            let mut cursor = tx.cursor_read::<T>().expect("Was not able to obtain a cursor.");
-
-            // TODO: Upstream this in the DB trait.
-            let start_walker = cursor.current().transpose();
-            let walker = Walker::new(&mut cursor, start_walker);
-
-            walker.skip(start).take(len).collect::<Vec<_>>()
-        })?;
-
-        data.into_iter()
-            .collect::<Result<BTreeMap<T::Key, T::Value>, _>>()
-            .map_err(|e| eyre::eyre!(e))
-    }
-
-    fn drop(&mut self, path: &PlatformPath<DbPath>) -> Result<()> {
-        info!(target: "reth::cli", "Dropping db at {}", path);
-        std::fs::remove_dir_all(path).wrap_err("Dropping the database failed")?;
         Ok(())
     }
 }

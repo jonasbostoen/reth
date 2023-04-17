@@ -6,9 +6,8 @@ use reth_db::{
     tables,
     transaction::DbTxMut,
 };
-use reth_eth_wire::BlockBody;
 use reth_interfaces::{db, p2p::bodies::response::BlockResponse};
-use reth_primitives::{Block, SealedBlock, SealedHeader, H256};
+use reth_primitives::{Block, BlockBody, SealedBlock, SealedHeader, H256};
 use std::collections::HashMap;
 
 pub(crate) fn zip_blocks<'a>(
@@ -25,7 +24,8 @@ pub(crate) fn zip_blocks<'a>(
                 BlockResponse::Full(SealedBlock {
                     header: header.clone(),
                     body: body.transactions,
-                    ommers: body.ommers.into_iter().map(|o| o.seal()).collect(),
+                    ommers: body.ommers.into_iter().map(|o| o.seal_slow()).collect(),
+                    withdrawals: body.withdrawals,
                 })
             }
         })
@@ -40,7 +40,7 @@ pub(crate) fn create_raw_bodies<'a>(
         .into_iter()
         .map(|header| {
             let body = bodies.remove(&header.hash()).expect("body exists");
-            body.create_block(header)
+            body.create_block(header.as_ref().clone())
         })
         .collect()
 }

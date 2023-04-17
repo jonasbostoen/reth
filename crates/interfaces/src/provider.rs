@@ -1,9 +1,9 @@
 use reth_primitives::{Address, BlockHash, BlockNumber, TransitionId, TxNumber, H256};
 
-/// KV error type. They are using u32 to represent error code.
+/// Bundled errors variants thrown by various providers.
 #[allow(missing_docs)]
 #[derive(Debug, thiserror::Error, PartialEq, Eq, Clone)]
-pub enum Error {
+pub enum ProviderError {
     /// The header hash is missing from the database.
     #[error("Block number {block_number} does not exist in database")]
     CanonicalHeader { block_number: BlockNumber },
@@ -17,8 +17,8 @@ pub enum Error {
     #[error("Block hash {block_hash:?} does not exist in Headers table")]
     BlockHash { block_hash: BlockHash },
     /// A block body is missing.
-    #[error("Block body not found for block #{number}")]
-    BlockBody { number: BlockNumber },
+    #[error("Block meta not found for block #{number}")]
+    BlockBodyIndices { number: BlockNumber },
     /// The block transition id for a certain block number is missing.
     #[error("Block transition id does not exist for block #{block_number}")]
     BlockTransition { block_number: BlockNumber },
@@ -68,4 +68,27 @@ pub enum Error {
     /// Reached the end of the transaction sender table.
     #[error("Got to the end of the transaction sender table")]
     EndOfTransactionSenderTable,
+    /// Missing block hash in BlockchainTree
+    #[error("Missing block hash for block #{block_number:?} in blockchain tree")]
+    BlockchainTreeBlockHash { block_number: BlockNumber },
+    /// Some error occurred while interacting with the state tree.
+    #[error("Unknown error occurred while interacting with the state trie.")]
+    StateTrie,
+    #[error("History state root, can't be calculated")]
+    HistoryStateRoot,
+    /// Thrown when required header related data was not found but was required.
+    #[error("requested data not found")]
+    HeaderNotFound,
+    /// Mismatch of sender and transaction
+    #[error("Mismatch of sender and transaction id {tx_id}")]
+    MismatchOfTransactionAndSenderId { tx_id: TxNumber },
+    /// Block body wrong transaction count
+    #[error("Stored block indices does not match transaction count")]
+    BlockBodyTransactionCount,
+    /// Thrown when the cache service task dropped
+    #[error("cache service task stopped")]
+    CacheServiceUnavailable,
+    /// Thrown when we failed to lookup a block for the pending state
+    #[error("Unknown block hash: {0:}")]
+    UnknownBlockHash(H256),
 }

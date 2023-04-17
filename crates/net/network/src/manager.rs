@@ -18,12 +18,12 @@
 use crate::{
     config::NetworkConfig,
     discovery::Discovery,
-    error::NetworkError,
+    error::{NetworkError, ServiceKind},
     eth_requests::IncomingEthRequest,
     import::{BlockImport, BlockImportOutcome, BlockValidation},
     listener::ConnectionListener,
     message::{NewBlockMessage, PeerMessage, PeerRequest, PeerRequestSender},
-    metrics::NetworkMetrics,
+    metrics::{DisconnectMetrics, NetworkMetrics},
     network::{NetworkHandle, NetworkHandleMessage},
     peers::{PeersHandle, PeersManager},
     session::SessionManager,
@@ -36,12 +36,13 @@ use futures::{Future, StreamExt};
 use parking_lot::Mutex;
 use reth_eth_wire::{
     capability::{Capabilities, CapabilityMessage},
-    DisconnectReason, Status,
+    DisconnectReason, EthVersion, Status,
 };
 use reth_net_common::bandwidth_meter::BandwidthMeter;
-use reth_network_api::{EthProtocolInfo, NetworkStatus, ReputationChangeKind};
+use reth_network_api::ReputationChangeKind;
 use reth_primitives::{NodeRecord, PeerId, H256};
 use reth_provider::BlockProvider;
+use reth_rpc_types::{EthProtocolInfo, NetworkStatus};
 use std::{
     net::SocketAddr,
     pin::Pin,
@@ -53,7 +54,7 @@ use std::{
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
-use tracing::{error, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 /// Manages the _entire_ state of the network.
 ///
 /// This is an endless [`Future`] that consistently drives the state of the entire network forward.
@@ -107,6 +108,8 @@ pub struct NetworkManager<C> {
     num_active_peers: Arc<AtomicUsize>,
     /// Metrics for the Network
     metrics: NetworkMetrics,
+    /// Disconnect metrics for the Network
+    disconnect_metrics: DisconnectMetrics,
 }
 
 // === impl NetworkManager ===
@@ -169,7 +172,9 @@ where
         let peers_manager = PeersManager::new(peers_config);
         let peers_handle = peers_manager.handle();
 
-        let incoming = ConnectionListener::bind(listener_addr).await?;
+        let incoming = ConnectionListener::bind(listener_addr).await.map_err(|err| {
+            NetworkError::from_io_error(err, ServiceKind::Listener(listener_addr))
+        })?;
         let listener_address = Arc::new(Mutex::new(incoming.local_address()));
 
         discovery_v4_config = discovery_v4_config.map(|mut disc_config| {
@@ -231,6 +236,7 @@ where
             to_eth_request_handler: None,
             num_active_peers,
             metrics: Default::default(),
+            disconnect_metrics: Default::default(),
         })
     }
 
@@ -240,19 +246,18 @@ where
     /// ```
     /// use reth_provider::test_utils::NoopProvider;
     /// use reth_transaction_pool::TransactionPool;
-    /// use std::sync::Arc;
-    /// use reth_discv4::bootnodes::mainnet_nodes;
+    /// use reth_primitives::mainnet_nodes;
     /// use reth_network::config::rng_secret_key;
     /// use reth_network::{NetworkConfig, NetworkManager};
     /// async fn launch<Pool: TransactionPool>(pool: Pool) {
     ///     // This block provider implementation is used for testing purposes.
-    ///     let client = Arc::new(NoopProvider::default());
+    ///     let client = NoopProvider::default();
     ///
     ///     // The key that's used for encrypting sessions and to identify our node.
     ///     let local_key = rng_secret_key();
     ///
     ///     let config =
-    ///         NetworkConfig::<NoopProvider>::builder(local_key).boot_nodes(mainnet_nodes()).build(Arc::clone(&client));
+    ///         NetworkConfig::<NoopProvider>::builder(local_key).boot_nodes(mainnet_nodes()).build(client.clone());
     ///
     ///     // create the network instance
     ///     let (handle, network, transactions, request_handler) = NetworkManager::builder(config)
@@ -555,7 +560,7 @@ where
 
 impl<C> Future for NetworkManager<C>
 where
-    C: BlockProvider,
+    C: BlockProvider + Unpin,
 {
     type Output = ();
 
@@ -633,6 +638,7 @@ where
                             peer_id,
                             remote_addr,
                             capabilities,
+                            version,
                             messages,
                             status,
                             direction,
@@ -647,16 +653,18 @@ where
                                 ?total_active,
                                 "Session established"
                             );
+                            debug!(target: "net", peer_enode=%NodeRecord::new(remote_addr, peer_id), "Established peer enode");
 
                             if direction.is_incoming() {
                                 this.swarm
                                     .state_mut()
                                     .peers_mut()
-                                    .on_active_inbound_session(peer_id, remote_addr);
+                                    .on_incoming_session_established(peer_id, remote_addr);
                             }
                             this.event_listeners.send(NetworkEvent::SessionEstablished {
                                 peer_id,
                                 capabilities,
+                                version,
                                 status,
                                 messages,
                             });
@@ -664,12 +672,16 @@ where
                         SwarmEvent::PeerAdded(peer_id) => {
                             trace!(target: "net", ?peer_id, "Peer added");
                             this.event_listeners.send(NetworkEvent::PeerAdded(peer_id));
-                            this.metrics.tracked_peers.increment(1f64);
+                            this.metrics
+                                .tracked_peers
+                                .set(this.swarm.state().peers().num_known_peers() as f64);
                         }
                         SwarmEvent::PeerRemoved(peer_id) => {
                             trace!(target: "net", ?peer_id, "Peer dropped");
                             this.event_listeners.send(NetworkEvent::PeerRemoved(peer_id));
-                            this.metrics.tracked_peers.decrement(1f64);
+                            this.metrics
+                                .tracked_peers
+                                .set(this.swarm.state().peers().num_known_peers() as f64);
                         }
                         SwarmEvent::SessionClosed { peer_id, remote_addr, error } => {
                             let total_active =
@@ -709,6 +721,9 @@ where
                             this.metrics
                                 .outgoing_connections
                                 .set(this.swarm.state().peers().num_outbound_connections() as f64);
+                            if let Some(reason) = reason {
+                                this.disconnect_metrics.increment(reason);
+                            }
                             this.event_listeners
                                 .send(NetworkEvent::SessionClosed { peer_id, reason });
                         }
@@ -726,6 +741,9 @@ where
                                     .peers_mut()
                                     .on_incoming_pending_session_dropped(remote_addr, err);
                                 this.metrics.pending_session_failures.increment(1);
+                                if let Some(reason) = err.as_disconnected() {
+                                    this.disconnect_metrics.increment(reason);
+                                }
                             } else {
                                 this.swarm
                                     .state_mut()
@@ -757,6 +775,9 @@ where
                                     err,
                                 );
                                 this.metrics.pending_session_failures.increment(1);
+                                if let Some(reason) = err.as_disconnected() {
+                                    this.disconnect_metrics.increment(reason);
+                                }
                             } else {
                                 this.swarm
                                     .state_mut()
@@ -840,6 +861,8 @@ pub enum NetworkEvent {
         messages: PeerRequestSender,
         /// The status of the peer to which a session was established.
         status: Status,
+        /// negotiated eth version of the session
+        version: EthVersion,
     },
     /// Event emitted when a new peer is added
     PeerAdded(PeerId),

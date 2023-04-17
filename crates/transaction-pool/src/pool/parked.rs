@@ -4,10 +4,15 @@ use crate::{
 use fnv::FnvHashMap;
 use std::{cmp::Ordering, collections::BTreeSet, ops::Deref, sync::Arc};
 
-/// A pool of transaction that are currently parked and wait for external changes that eventually
-/// move the transaction into the pending pool.
+/// A pool of transactions that are currently parked and are waiting for external changes (e.g.
+/// basefee, ancestor transactions, balance) that eventually move the transaction into the pending
+/// pool.
 ///
-/// This pool is a bijection: at all times each set contains the same transactions.
+/// This pool is a bijection: at all times each set (`best`, `by_id`) contains the same
+/// transactions.
+///
+/// Note: This type is generic over [ParkedPool] which enforces that the underlying transaction type
+/// is [ValidPoolTransaction] wrapped in an [Arc].
 pub(crate) struct ParkedPool<T: ParkedOrd> {
     /// Keeps track of transactions inserted in the pool.
     ///
@@ -35,7 +40,11 @@ impl<T: ParkedOrd> ParkedPool<T> {
     /// If the transaction is already included.
     pub(crate) fn add_transaction(&mut self, tx: Arc<ValidPoolTransaction<T::Transaction>>) {
         let id = *tx.id();
-        assert!(!self.by_id.contains_key(&id), "transaction already included");
+        assert!(
+            !self.by_id.contains_key(&id),
+            "transaction already included {:?}",
+            self.by_id.contains_key(&id)
+        );
         let submission_id = self.next_id();
 
         // keep track of size
@@ -231,8 +240,8 @@ impl<T: PoolTransaction> Ord for BasefeeOrd<T> {
 /// `Queued` transactions are transactions that are currently blocked by other parked (basefee,
 /// queued) or missing transactions.
 ///
-/// The primary order function for is always compares via the timestamp when the transaction was
-/// created
+/// The primary order function always compares the transaction costs first. In case these
+/// are equal, it compares the timestamps when the transactions were created.
 #[derive(Debug)]
 pub(crate) struct QueuedOrd<T: PoolTransaction>(Arc<ValidPoolTransaction<T>>);
 
@@ -240,6 +249,9 @@ impl_ord_wrapper!(QueuedOrd);
 
 impl<T: PoolTransaction> Ord for QueuedOrd<T> {
     fn cmp(&self, other: &Self) -> Ordering {
-        other.timestamp.cmp(&self.timestamp)
+        // Higher cost is better
+        self.cost.cmp(&other.cost).then_with(||
+            // Lower timestamp is better
+            other.timestamp.cmp(&self.timestamp))
     }
 }

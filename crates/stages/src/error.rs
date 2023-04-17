@@ -1,7 +1,6 @@
 use crate::pipeline::PipelineEvent;
 use reth_interfaces::{
-    consensus, db::Error as DbError, executor, p2p::error::DownloadError,
-    provider::Error as ProviderError,
+    consensus, db::Error as DbError, executor, p2p::error::DownloadError, provider::ProviderError,
 };
 use reth_primitives::BlockNumber;
 use reth_provider::TransactionError;
@@ -18,7 +17,7 @@ pub enum StageError {
         block: BlockNumber,
         /// The underlying consensus error.
         #[source]
-        error: consensus::Error,
+        error: consensus::ConsensusError,
     },
     /// The stage encountered a database error.
     #[error("An internal database error occurred: {0}")]
@@ -33,6 +32,12 @@ pub enum StageError {
         #[source]
         error: executor::Error,
     },
+    /// Invalid checkpoint passed to the stage
+    #[error("Invalid stage progress: {0}")]
+    StageProgress(u64),
+    /// Download channel closed
+    #[error("Download channel closed")]
+    ChannelClosed,
     /// The stage encountered a database integrity error.
     #[error("A database integrity error occurred: {0}")]
     DatabaseIntegrity(#[from] ProviderError),
@@ -43,9 +48,6 @@ pub enum StageError {
     /// rely on external downloaders
     #[error("Invalid download response: {0}")]
     Download(#[from] DownloadError),
-    /// Invalid checkpoint passed to the stage
-    #[error("Invalid stage progress: {0}")]
-    StageProgress(u64),
     /// The stage encountered a recoverable error.
     ///
     /// These types of errors are caught by the [Pipeline][crate::Pipeline] and trigger a restart
@@ -68,7 +70,10 @@ impl StageError {
                 StageError::Download(_) |
                 StageError::DatabaseIntegrity(_) |
                 StageError::StageProgress(_) |
-                StageError::Fatal(_)
+                StageError::ExecutionError { .. } |
+                StageError::ChannelClosed |
+                StageError::Fatal(_) |
+                StageError::Transaction(_)
         )
     }
 }

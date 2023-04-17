@@ -119,7 +119,7 @@ fn load_field(field: &syn::Field, fields: &mut FieldList, is_enum: bool) {
             } else {
                 let should_compact = is_flag_type(&ftype) ||
                     field.attrs.iter().any(|attr| {
-                        attr.path.segments.iter().any(|path| path.ident == "maybe_zero")
+                        attr.path().segments.iter().any(|path| path.ident == "maybe_zero")
                     });
 
                 fields.push(FieldTypes::StructField((
@@ -162,7 +162,7 @@ pub fn get_bit_size(ftype: &str) -> u8 {
     match ftype {
         "bool" | "Option" => 1,
         "TxType" => 2,
-        "u64" | "BlockNumber" | "TxNumber" | "ChainId" => 4,
+        "u64" | "BlockNumber" | "TxNumber" | "ChainId" | "TransitionId" | "NumTransactions" => 4,
         "u128" => 5,
         "U256" | "TxHash" => 6,
         _ => 0,
@@ -238,18 +238,18 @@ mod tests {
             #[cfg(test)]
             #[allow(dead_code)]
             #[test_fuzz::test_fuzz]
-            fn fuzz_test_TestStruct(obj: TestStruct) {
+            fn fuzz_test_test_struct(obj: TestStruct) {
                 let mut buf = vec![];
                 let len = obj.clone().to_compact(&mut buf);
                 let (same_obj, buf) = TestStruct::from_compact(buf.as_ref(), len);
                 assert_eq!(obj, same_obj);
             }
             #[test]
-            pub fn fuzz_TestStruct() {
-                fuzz_test_TestStruct(TestStruct::default())
+            pub fn fuzz_test_struct() {
+                fuzz_test_test_struct(TestStruct::default())
             }
             impl Compact for TestStruct {
-                fn to_compact(self, buf: &mut impl bytes::BufMut) -> usize {
+                fn to_compact<B>(self, buf: &mut B) -> usize where B: bytes::BufMut + AsMut<[u8]> {
                     let mut flags = TestStructFlags::default();
                     let mut total_len = 0;
                     let mut buffer = bytes::BytesMut::new();

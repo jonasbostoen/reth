@@ -69,7 +69,7 @@ pub enum ParseNatResolverError {
     AddrParseError(#[from] AddrParseError),
     /// Failed to parse due to unknown variant
     #[error("Unknown Nat Resolver variant: {0}")]
-    UnknonwVariant(String),
+    UnknownVariant(String),
 }
 
 impl FromStr for NatResolver {
@@ -82,13 +82,10 @@ impl FromStr for NatResolver {
             "none" => NatResolver::None,
             "publicip" | "public-ip" => NatResolver::PublicIp,
             s => {
-                if let Some(ip) = s.strip_prefix("extip:") {
-                    NatResolver::ExternalIp(ip.parse::<IpAddr>()?)
-                } else {
-                    return Err(ParseNatResolverError::UnknonwVariant(format!(
+                let Some(ip) = s.strip_prefix("extip:") else { return Err(ParseNatResolverError::UnknownVariant(format!(
                         "Unknown Nat Resolver: {s}"
-                    )))
-                }
+                    ))) };
+                NatResolver::ExternalIp(ip.parse::<IpAddr>()?)
             }
         };
         Ok(r)

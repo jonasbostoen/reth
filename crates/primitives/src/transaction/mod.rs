@@ -1,18 +1,22 @@
 use crate::{keccak256, Address, Bytes, ChainId, TxHash, H256};
-pub use access_list::{AccessList, AccessListItem};
+pub use access_list::{AccessList, AccessListItem, AccessListWithGasUsed};
 use bytes::{Buf, BytesMut};
 use derive_more::{AsRef, Deref};
+pub use error::InvalidTransactionError;
+pub use meta::TransactionMeta;
 use reth_codecs::{add_arbitrary_tests, main_codec, Compact};
 use reth_rlp::{
     length_of_length, Decodable, DecodeError, Encodable, Header, EMPTY_LIST_CODE, EMPTY_STRING_CODE,
 };
 pub use signature::Signature;
-pub use tx_type::TxType;
+pub use tx_type::{TxType, EIP1559_TX_TYPE_ID, EIP2930_TX_TYPE_ID, LEGACY_TX_TYPE_ID};
 
 mod access_list;
+mod error;
+mod meta;
 mod signature;
 mod tx_type;
-mod util;
+pub(crate) mod util;
 
 /// Legacy transaction.
 #[main_codec]
@@ -174,6 +178,8 @@ pub enum Transaction {
     Eip1559(TxEip1559),
 }
 
+// === impl Transaction ===
+
 impl Transaction {
     /// Heavy operation that return signature hash over rlp encoded transaction.
     /// It is only for signature signing or signer recovery.
@@ -247,7 +253,9 @@ impl Transaction {
         }
     }
 
-    /// Max fee per gas for eip1559 transaction, for legacy transactions this is gas_price
+    /// Max fee per gas for eip1559 transaction, for legacy transactions this is gas_price.
+    ///
+    /// This is also commonly referred to as the "Gas Fee Cap" (`GasFeeCap`).
     pub fn max_fee_per_gas(&self) -> u128 {
         match self {
             Transaction::Legacy(TxLegacy { gas_price, .. }) |
@@ -258,6 +266,8 @@ impl Transaction {
 
     /// Max priority fee per gas for eip1559 transaction, for legacy and eip2930 transactions this
     /// is `None`
+    ///
+    /// This is also commonly referred to as the "Gas Tip Cap" (`GasTipCap`).
     pub fn max_priority_fee_per_gas(&self) -> Option<u128> {
         match self {
             Transaction::Legacy(_) => None,
@@ -266,6 +276,30 @@ impl Transaction {
                 Some(*max_priority_fee_per_gas)
             }
         }
+    }
+
+    /// Returns the effective miner gas tip cap (`gasTipCap`) for the given base fee.
+    ///
+    /// Returns `None` if the basefee is higher than the [Transaction::max_fee_per_gas].
+    pub fn effective_tip_per_gas(&self, base_fee: u64) -> Option<u128> {
+        let base_fee = base_fee as u128;
+        let max_fee_per_gas = self.max_fee_per_gas();
+
+        if max_fee_per_gas < base_fee {
+            return None
+        }
+
+        // the miner tip is the difference between the max fee and the base fee or the
+        // max_priority_fee_per_gas, whatever is lower
+
+        // SAFETY: max_fee_per_gas >= base_fee
+        let fee = max_fee_per_gas - base_fee;
+
+        if let Some(priority_fee) = self.max_priority_fee_per_gas() {
+            return Some(fee.min(priority_fee))
+        }
+
+        Some(fee)
     }
 
     /// Get the transaction's input field.
@@ -534,6 +568,12 @@ pub struct TransactionSigned {
     pub transaction: Transaction,
 }
 
+impl AsRef<Self> for TransactionSigned {
+    fn as_ref(&self) -> &Self {
+        self
+    }
+}
+
 // === impl TransactionSigned ===
 
 impl TransactionSigned {
@@ -549,7 +589,7 @@ impl TransactionSigned {
 
     /// Recover signer from signature and hash.
     ///
-    /// Returns `None` if the transaction's signature is invalid.
+    /// Returns `None` if the transaction's signature is invalid, see also [Self::recover_signer].
     pub fn recover_signer(&self) -> Option<Address> {
         let signature_hash = self.signature_hash();
         self.signature.recover_signer(signature_hash)
@@ -557,7 +597,7 @@ impl TransactionSigned {
 
     /// Devour Self, recover signer and return [`TransactionSignedEcRecovered`]
     ///
-    /// Returns `None` if the transaction's signature is invalid.
+    /// Returns `None` if the transaction's signature is invalid, see also [Self::recover_signer].
     pub fn into_ecrecovered(self) -> Option<TransactionSignedEcRecovered> {
         let signer = self.recover_signer()?;
         Some(TransactionSignedEcRecovered { signed_transaction: self, signer })
@@ -854,6 +894,8 @@ pub struct TransactionSignedEcRecovered {
     signed_transaction: TransactionSigned,
 }
 
+// === impl TransactionSignedEcRecovered ===
+
 impl TransactionSignedEcRecovered {
     /// Signer of transaction recovered from signature
     pub fn signer(&self) -> Address {
@@ -865,10 +907,35 @@ impl TransactionSignedEcRecovered {
         self.signed_transaction
     }
 
+    /// Desolve Self to its component
+    pub fn to_components(self) -> (TransactionSigned, Address) {
+        (self.signed_transaction, self.signer)
+    }
+
     /// Create [`TransactionSignedEcRecovered`] from [`TransactionSigned`] and [`Address`] of the
     /// signer.
     pub fn from_signed_transaction(signed_transaction: TransactionSigned, signer: Address) -> Self {
         Self { signed_transaction, signer }
+    }
+}
+
+impl Encodable for TransactionSignedEcRecovered {
+    fn encode(&self, out: &mut dyn bytes::BufMut) {
+        self.signed_transaction.encode(out)
+    }
+
+    fn length(&self) -> usize {
+        self.signed_transaction.length()
+    }
+}
+
+impl Decodable for TransactionSignedEcRecovered {
+    fn decode(buf: &mut &[u8]) -> Result<Self, DecodeError> {
+        let signed_transaction = TransactionSigned::decode(buf)?;
+        let signer = signed_transaction
+            .recover_signer()
+            .ok_or(DecodeError::Custom("Unable to recover decoded transaction signer."))?;
+        Ok(TransactionSignedEcRecovered { signer, signed_transaction })
     }
 }
 
@@ -886,16 +953,6 @@ impl FromRecoveredTransaction for TransactionSignedEcRecovered {
     #[inline]
     fn from_recovered_transaction(tx: TransactionSignedEcRecovered) -> Self {
         tx
-    }
-}
-
-impl Encodable for TransactionSignedEcRecovered {
-    fn encode(&self, out: &mut dyn bytes::BufMut) {
-        self.signed_transaction.encode(out)
-    }
-
-    fn length(&self) -> usize {
-        self.signed_transaction.length()
     }
 }
 
@@ -919,7 +976,8 @@ impl IntoRecoveredTransaction for TransactionSignedEcRecovered {
 mod tests {
     use crate::{
         transaction::{signature::Signature, TransactionKind, TxEip1559, TxEip2930, TxLegacy},
-        AccessList, Address, Bytes, Transaction, TransactionSigned, H256, U256,
+        AccessList, Address, Bytes, Transaction, TransactionSigned, TransactionSignedEcRecovered,
+        H256, U256,
     };
     use bytes::BytesMut;
     use ethers_core::utils::hex;
@@ -1243,5 +1301,19 @@ mod tests {
 
         let encoded = decoded.envelope_encoded();
         assert_eq!(encoded, input);
+    }
+
+    #[test]
+    fn test_decode_signed_ec_recovered_transaction() {
+        // random tx: <https://etherscan.io/getRawTx?tx=0x9448608d36e721ef403c53b00546068a6474d6cbab6816c3926de449898e7bce>
+        let input = hex::decode("02f871018302a90f808504890aef60826b6c94ddf4c5025d1a5742cf12f74eec246d4432c295e487e09c3bbcc12b2b80c080a0f21a4eacd0bf8fea9c5105c543be5a1d8c796516875710fafafdf16d16d8ee23a001280915021bb446d1973501a67f93d2b38894a514b976e7b46dc2fe54598d76").unwrap();
+        let tx = TransactionSigned::decode(&mut &input[..]).unwrap();
+        let recovered = tx.into_ecrecovered().unwrap();
+
+        let mut encoded = BytesMut::new();
+        recovered.encode(&mut encoded);
+
+        let decoded = TransactionSignedEcRecovered::decode(&mut &encoded[..]).unwrap();
+        assert_eq!(recovered, decoded)
     }
 }

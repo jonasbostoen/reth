@@ -1,5 +1,4 @@
 use crate::{
-    database::Database,
     error::{mdbx_result, Error, Result},
     flags::*,
     mdbx_try_optional,
@@ -32,15 +31,13 @@ where
 {
     pub(crate) fn new<E: EnvironmentKind>(
         txn: &'txn Transaction<K, E>,
-        db: &Database<'txn>,
+        dbi: ffi::MDBX_dbi,
     ) -> Result<Self> {
         let mut cursor: *mut ffi::MDBX_cursor = ptr::null_mut();
 
         let txn = txn.txn_mutex();
         unsafe {
-            mdbx_result(txn_execute(&txn, |txn| {
-                ffi::mdbx_cursor_open(txn, db.dbi(), &mut cursor)
-            }))?;
+            mdbx_result(txn_execute(&txn, |txn| ffi::mdbx_cursor_open(txn, dbi, &mut cursor)))?;
         }
         Ok(Self { txn, cursor, _marker: PhantomData })
     }
@@ -760,15 +757,13 @@ where
                     let err_code =
                         unsafe { ffi::mdbx_cursor_get(cursor.cursor(), &mut key, &mut data, op) };
 
-                    if err_code == ffi::MDBX_SUCCESS {
-                        Some(IntoIter::new(
+                    (err_code == ffi::MDBX_SUCCESS).then(|| {
+                        IntoIter::new(
                             Cursor::new_at_position(&**cursor).unwrap(),
                             ffi::MDBX_GET_CURRENT,
                             ffi::MDBX_NEXT_DUP,
-                        ))
-                    } else {
-                        None
-                    }
+                        )
+                    })
                 })
             }
             IterDup::Err(err) => err.take().map(|e| IntoIter::Err(Some(e))),

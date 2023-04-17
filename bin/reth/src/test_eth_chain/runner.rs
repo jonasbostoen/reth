@@ -10,8 +10,8 @@ use reth_db::{
     Error as DbError,
 };
 use reth_primitives::{
-    keccak256, Account as RethAccount, Address, ChainSpec, ForkCondition, Hardfork, JsonU256,
-    SealedBlock, SealedHeader, StorageEntry, H256, U256,
+    keccak256, Account as RethAccount, Address, Bytecode, ChainSpec, ForkCondition, Hardfork,
+    JsonU256, SealedBlock, SealedHeader, StorageEntry, H256, U256,
 };
 use reth_provider::Transaction;
 use reth_rlp::Decodable;
@@ -20,6 +20,7 @@ use std::{
     collections::HashMap,
     ffi::OsStr,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 use tracing::{debug, trace};
 
@@ -67,7 +68,7 @@ pub fn should_skip(path: &Path) -> bool {
         return true
     }
 
-    // Skip test where basefee/accesslist/diffuculty is present but it shouldn't be supported in
+    // Skip test where basefee/accesslist/difficulty is present but it shouldn't be supported in
     // London/Berlin/TheMerge. https://github.com/ethereum/tests/blob/5b7e1ab3ffaf026d99d20b17bb30f533a2c80c8b/GeneralStateTests/stExample/eip1559.json#L130
     // It is expected to not execute these tests.
     if path.file_name() == Some(OsStr::new("accessListExample.json")) ||
@@ -88,6 +89,13 @@ pub fn should_skip(path: &Path) -> bool {
     {
         return true
     }
+
+    // Ignore outdated EOF tests that haven't been updated for Cancun yet.
+    let eof_path = Path::new("EIPTests").join("stEOF");
+    if path.to_string_lossy().contains(&*eof_path.to_string_lossy()) {
+        return true
+    }
+
     false
 }
 
@@ -112,13 +120,10 @@ pub async fn run_test(path: PathBuf) -> eyre::Result<TestOutcome> {
                 ForkSpec::MergeEOF |
                 ForkSpec::MergeMeterInitCode |
                 ForkSpec::MergePush0 |
-                ForkSpec::Shanghai |
                 ForkSpec::Unknown
         ) {
             continue
         }
-
-        // if matches!(suite.pre, State(RootOrState::Root(_))) {}
 
         let pre_state = suite.pre.0;
 
@@ -134,20 +139,20 @@ pub async fn run_test(path: PathBuf) -> eyre::Result<TestOutcome> {
 
         // insert genesis
         let header: SealedHeader = suite.genesis_block_header.into();
-        let genesis_block = SealedBlock { header, body: vec![], ommers: vec![] };
-        reth_provider::insert_canonical_block(&tx, &genesis_block, has_block_reward)?;
+        let genesis_block = SealedBlock { header, body: vec![], ommers: vec![], withdrawals: None };
+        reth_provider::insert_canonical_block(&tx, genesis_block, None, has_block_reward)?;
 
         let mut last_block = None;
         suite.blocks.iter().try_for_each(|block| -> eyre::Result<()> {
             let decoded = SealedBlock::decode(&mut block.rlp.as_ref())?;
             last_block = Some(decoded.number);
-            reth_provider::insert_canonical_block(&tx, &decoded, has_block_reward)?;
+            reth_provider::insert_canonical_block(&tx, decoded, None, has_block_reward)?;
             Ok(())
         })?;
 
         pre_state.into_iter().try_for_each(|(address, account)| -> eyre::Result<()> {
             let has_code = !account.code.is_empty();
-            let code_hash = if has_code { Some(keccak256(&account.code)) } else { None };
+            let code_hash = has_code.then(|| keccak256(&account.code));
             tx.put::<tables::PlainAccountState>(
                 address,
                 RethAccount {
@@ -157,7 +162,7 @@ pub async fn run_test(path: PathBuf) -> eyre::Result<TestOutcome> {
                 },
             )?;
             if let Some(code_hash) = code_hash {
-                tx.put::<tables::Bytecodes>(code_hash, account.code.to_vec())?;
+                tx.put::<tables::Bytecodes>(code_hash, Bytecode::new_raw(account.code.0))?;
             }
             account.storage.iter().try_for_each(|(k, v)| {
                 trace!(target: "reth::cli", ?address, key = ?k.0, value = ?v.0, "Update storage");
@@ -189,7 +194,8 @@ pub async fn run_test(path: PathBuf) -> eyre::Result<TestOutcome> {
 
         // Initialize the execution stage
         // Hardcode the chain_id to Ethereum 1.
-        let mut stage = ExecutionStage::new(chain_spec, 1000);
+        let factory = reth_revm::Factory::new(Arc::new(chain_spec));
+        let mut stage = ExecutionStage::new(factory, 1_000);
 
         // Call execution stage
         let input = ExecInput {
