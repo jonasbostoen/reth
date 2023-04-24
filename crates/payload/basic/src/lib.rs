@@ -15,8 +15,11 @@ use reth_payload_builder::{
 };
 use reth_primitives::{
     bytes::{Bytes, BytesMut},
-    constants::{RETH_CLIENT_VERSION, SLOT_DURATION},
-    proofs, Block, ChainSpec, Header, IntoRecoveredTransaction, Receipt, EMPTY_OMMER_ROOT, U256,
+    constants::{
+        EMPTY_RECEIPTS, EMPTY_TRANSACTIONS, EMPTY_WITHDRAWALS, RETH_CLIENT_VERSION, SLOT_DURATION,
+    },
+    proofs, Block, BlockId, BlockNumberOrTag, ChainSpec, Header, IntoRecoveredTransaction, Receipt,
+    SealedBlock, EMPTY_OMMER_ROOT, U256,
 };
 use reth_provider::{BlockProvider, PostState, StateProviderFactory};
 use reth_revm::{
@@ -99,9 +102,17 @@ where
         attributes: PayloadBuilderAttributes,
     ) -> Result<Self::Job, PayloadBuilderError> {
         // TODO this needs to access the _pending_ state of the parent block hash
+
+        let block_id: BlockId = if attributes.parent.is_zero() {
+            // use latest block if parent is zero: genesis block
+            BlockNumberOrTag::Latest.into()
+        } else {
+            attributes.parent.into()
+        };
+
         let parent_block = self
             .client
-            .block_by_hash(attributes.parent)?
+            .block(block_id)?
             .ok_or_else(|| PayloadBuilderError::MissingParentBlock(attributes.parent))?;
 
         // configure evm env based on parent block
@@ -111,7 +122,7 @@ where
         let config = PayloadConfig {
             initialized_block_env,
             initialized_cfg,
-            parent_block: Arc::new(parent_block),
+            parent_block: Arc::new(parent_block.seal_slow()),
             extra_data: self.config.extradata.clone(),
             attributes,
             chain_spec: Arc::clone(&self.chain_spec),
@@ -324,9 +335,17 @@ where
     Pool: TransactionPool + Unpin + 'static,
     Tasks: TaskSpawner + Clone + 'static,
 {
-    fn best_payload(&self) -> Arc<BuiltPayload> {
-        // TODO if still not set, initialize empty block
-        self.best_payload.clone().unwrap()
+    fn best_payload(&self) -> Result<Arc<BuiltPayload>, PayloadBuilderError> {
+        if let Some(ref payload) = self.best_payload {
+            return Ok(payload.clone())
+        }
+        // No payload has been built yet, but we need to return something that the CL then can
+        // deliver, so we need to return an empty payload.
+        //
+        // Note: it is assumed that this is unlikely to happen, as the payload job is started right
+        // away and the first full block should have been built by the time CL is requesting the
+        // payload.
+        build_empty_payload(&self.client, self.config.clone()).map(Arc::new)
     }
 }
 
@@ -348,6 +367,8 @@ impl Future for PendingPayload {
 }
 
 /// A marker that can be used to cancel a job.
+///
+/// If dropped, it will set the `cancelled` flag to true.
 #[derive(Default, Clone)]
 struct Cancelled(Arc<AtomicBool>);
 
@@ -374,7 +395,7 @@ struct PayloadConfig {
     /// Configuration for the environment.
     initialized_cfg: CfgEnv,
     /// The parent block.
-    parent_block: Arc<Block>,
+    parent_block: Arc<SealedBlock>,
     /// Block extra data.
     extra_data: Bytes,
     /// Requested attributes for the payload.
@@ -440,6 +461,8 @@ fn build_payload<Pool, Client>(
         let mut total_fees = U256::ZERO;
         let base_fee = initialized_block_env.basefee.to::<u64>();
 
+        let block_number = initialized_block_env.number.to::<u64>();
+
         for tx in best_txs {
             // ensure we still have capacity for this transaction
             if cumulative_gas_used + tx.gas_limit() > block_gas_limit {
@@ -468,9 +491,13 @@ fn build_payload<Pool, Client>(
             // TODO skip invalid transactions
             let ResultAndState { result, state } =
                 evm.transact().map_err(PayloadBuilderError::EvmExecutionError)?;
+            let gas_used = result.gas_used();
 
             // commit changes
-            commit_state_changes(&mut db, &mut post_state, state, true);
+            commit_state_changes(&mut db, &mut post_state, block_number, state, true);
+
+            // add gas used by the transaction to cumulative gas used, before creating the receipt
+            cumulative_gas_used += gas_used;
 
             // Push transaction changeset and calculate header bloom filter for receipt.
             post_state.add_receipt(Receipt {
@@ -480,16 +507,11 @@ fn build_payload<Pool, Client>(
                 logs: result.logs().into_iter().map(into_reth_log).collect(),
             });
 
-            let gas_used = result.gas_used();
-
             // update add to total fees
             let miner_fee = tx
                 .effective_tip_per_gas(base_fee)
                 .expect("fee is always valid; execution succeeded");
             total_fees += U256::from(miner_fee) * U256::from(gas_used);
-
-            // append gas used
-            cumulative_gas_used += gas_used;
 
             // append transaction to the list of executed transactions
             executed_txs.push(tx.into_signed());
@@ -502,6 +524,7 @@ fn build_payload<Pool, Client>(
         }
 
         let mut withdrawals_root = None;
+        let mut withdrawals = None;
 
         // get balance changes from withdrawals
         if initialized_cfg.spec_id >= SpecId::SHANGHAI {
@@ -511,12 +534,21 @@ fn build_payload<Pool, Client>(
                 &attributes.withdrawals,
             );
             for (address, increment) in balance_increments {
-                increment_account_balance(&mut db, &mut post_state, address, increment)?;
+                increment_account_balance(
+                    &mut db,
+                    &mut post_state,
+                    block_number,
+                    address,
+                    increment,
+                )?;
             }
 
             // calculate withdrawals root
             withdrawals_root =
                 Some(proofs::calculate_withdrawals_root(attributes.withdrawals.iter()));
+
+            // set withdrawals
+            withdrawals = Some(attributes.withdrawals);
         }
 
         // create the block header
@@ -526,7 +558,7 @@ fn build_payload<Pool, Client>(
         let logs_bloom = post_state.logs_bloom();
 
         let header = Header {
-            parent_hash: attributes.parent,
+            parent_hash: parent_block.hash,
             ommers_hash: EMPTY_OMMER_ROOT,
             beneficiary: initialized_block_env.coinbase,
             // TODO compute state root
@@ -547,17 +579,71 @@ fn build_payload<Pool, Client>(
         };
 
         // seal the block
-        let block = Block {
-            header,
-            body: executed_txs,
-            ommers: vec![],
-            withdrawals: Some(attributes.withdrawals),
-        };
+        let block = Block { header, body: executed_txs, ommers: vec![], withdrawals };
 
         let sealed_block = block.seal_slow();
         Ok(BuildOutcome::Better(BuiltPayload::new(attributes.id, sealed_block, total_fees)))
     }
     let _ = to_job.send(try_build(client, pool, config, cancel, best_payload));
+}
+
+/// Builds an empty payload without any transactions.
+fn build_empty_payload<Client>(
+    client: &Client,
+    config: PayloadConfig,
+) -> Result<BuiltPayload, PayloadBuilderError>
+where
+    Client: StateProviderFactory,
+{
+    // TODO this needs to access the _pending_ state of the parent block hash
+    let _state = client.latest()?;
+
+    let PayloadConfig {
+        initialized_block_env,
+        parent_block,
+        extra_data,
+        attributes,
+        initialized_cfg,
+        ..
+    } = config;
+
+    let base_fee = initialized_block_env.basefee.to::<u64>();
+    let block_gas_limit: u64 = initialized_block_env.gas_limit.try_into().unwrap_or(u64::MAX);
+
+    let mut withdrawals_root = None;
+    let mut withdrawals = None;
+
+    if initialized_cfg.spec_id >= SpecId::SHANGHAI {
+        withdrawals_root = Some(EMPTY_WITHDRAWALS);
+        // set withdrawals
+        withdrawals = Some(attributes.withdrawals);
+    }
+
+    let header = Header {
+        parent_hash: parent_block.hash,
+        ommers_hash: EMPTY_OMMER_ROOT,
+        beneficiary: initialized_block_env.coinbase,
+        // TODO compute state root
+        state_root: Default::default(),
+        transactions_root: EMPTY_TRANSACTIONS,
+        withdrawals_root,
+        receipts_root: EMPTY_RECEIPTS,
+        logs_bloom: Default::default(),
+        timestamp: attributes.timestamp,
+        mix_hash: attributes.prev_randao,
+        nonce: 0,
+        base_fee_per_gas: Some(base_fee),
+        number: parent_block.number + 1,
+        gas_limit: block_gas_limit,
+        difficulty: U256::ZERO,
+        gas_used: 0,
+        extra_data: extra_data.into(),
+    };
+
+    let block = Block { header, body: vec![], ommers: vec![], withdrawals };
+    let sealed_block = block.seal_slow();
+
+    Ok(BuiltPayload::new(attributes.id, sealed_block, U256::ZERO))
 }
 
 /// Checks if the new payload is better than the current best.

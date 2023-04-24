@@ -320,7 +320,7 @@ impl Consensus for TestConsensus {
 
     fn validate_header(
         &self,
-        header: &SealedHeader,
+        header: &Header,
         total_difficulty: U256,
     ) -> Result<(), ConsensusError> {
         if self.fail_validation() {
@@ -336,9 +336,5 @@ impl Consensus for TestConsensus {
         } else {
             Ok(())
         }
-    }
-
-    fn has_block_reward(&self, _: U256, _: U256) -> bool {
-        true
     }
 }

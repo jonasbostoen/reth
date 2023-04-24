@@ -11,7 +11,8 @@ use jsonrpsee::{
 use reth_network_api::{NetworkInfo, Peers};
 use reth_provider::{BlockProvider, EvmEnvProvider, HeaderProvider, StateProviderFactory};
 use reth_rpc::{
-    eth::cache::EthStateCache, AuthLayer, Claims, EthApi, EthFilter, JwtAuthValidator, JwtSecret,
+    eth::cache::EthStateCache, AuthLayer, Claims, EngineEthApi, EthApi, EthFilter,
+    JwtAuthValidator, JwtSecret,
 };
 use reth_rpc_api::{servers::*, EngineApiServer};
 use reth_tasks::TaskSpawner;
@@ -47,8 +48,8 @@ where
 {
     // spawn a new cache task
     let eth_cache = EthStateCache::spawn_with(client.clone(), Default::default(), executor);
-    let eth_api = EthApi::new(client.clone(), pool.clone(), network, eth_cache);
-    let eth_filter = EthFilter::new(client, pool);
+    let eth_api = EthApi::new(client.clone(), pool.clone(), network, eth_cache.clone());
+    let eth_filter = EthFilter::new(client, pool, eth_cache.clone());
     launch_with_eth_api(eth_api, eth_filter, engine_api, socket_addr, secret).await
 }
 
@@ -75,8 +76,8 @@ where
     // Configure the module and start the server.
     let mut module = RpcModule::new(());
     module.merge(engine_api.into_rpc()).expect("No conflicting methods");
-    module.merge(eth_api.into_rpc()).expect("No conflicting methods");
-    module.merge(eth_filter.into_rpc()).expect("No conflicting methods");
+    let engine_eth = EngineEthApi::new(eth_api, eth_filter);
+    module.merge(engine_eth.into_rpc()).expect("No conflicting methods");
 
     // Create auth middleware.
     let middleware =

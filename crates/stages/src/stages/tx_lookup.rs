@@ -1,7 +1,5 @@
-use crate::{
-    exec_or_return, ExecAction, ExecInput, ExecOutput, Stage, StageError, StageId, UnwindInput,
-    UnwindOutput,
-};
+use crate::{ExecInput, ExecOutput, Stage, StageError, StageId, UnwindInput, UnwindOutput};
+use itertools::Itertools;
 use rayon::prelude::*;
 use reth_db::{
     cursor::{DbCursorRO, DbCursorRW},
@@ -9,7 +7,10 @@ use reth_db::{
     tables,
     transaction::{DbTx, DbTxMut},
 };
+use reth_primitives::{rpc_utils::keccak256, BlockNumber, TransactionSignedNoHash, TxNumber, H256};
 use reth_provider::Transaction;
+use thiserror::Error;
+use tokio::sync::mpsc;
 use tracing::*;
 
 /// The [`StageId`] of the transaction lookup stage.
@@ -18,11 +19,11 @@ pub const TRANSACTION_LOOKUP: StageId = StageId("TransactionLookup");
 /// The transaction lookup stage.
 ///
 /// This stage walks over the bodies table, and sets the transaction hash of each transaction in a
-/// block to the corresponding `TransitionId` at each block. This is written to the
+/// block to the corresponding `BlockNumber` at each block. This is written to the
 /// [`tables::TxHashNumber`] This is used for looking up changesets via the transaction hash.
 #[derive(Debug, Clone)]
 pub struct TransactionLookupStage {
-    /// The number of table entries to commit at once
+    /// The number of blocks to commit at once
     commit_threshold: u64,
 }
 
@@ -46,38 +47,74 @@ impl<DB: Database> Stage<DB> for TransactionLookupStage {
         TRANSACTION_LOOKUP
     }
 
-    /// Write total difficulty entries
+    /// Write transaction hash -> id entries
     async fn execute(
         &mut self,
         tx: &mut Transaction<'_, DB>,
         input: ExecInput,
     ) -> Result<ExecOutput, StageError> {
-        let ((start_block, end_block), capped) =
-            exec_or_return!(input, self.commit_threshold, "sync::stages::transaction_lookup");
+        let (range, is_final_range) = input.next_block_range_with_threshold(self.commit_threshold);
+        if range.is_empty() {
+            return Ok(ExecOutput::done(*range.end()))
+        }
+        let (start_block, end_block) = range.into_inner();
 
         debug!(target: "sync::stages::transaction_lookup", start_block, end_block, "Commencing sync");
 
         let mut block_meta_cursor = tx.cursor_read::<tables::BlockBodyIndices>()?;
+
+        let (_, first_block) = block_meta_cursor.seek_exact(start_block)?.ok_or(
+            StageError::from(TransactionLookupStageError::TransactionLookup { block: start_block }),
+        )?;
+
+        let (_, last_block) = block_meta_cursor.seek_exact(end_block)?.ok_or(StageError::from(
+            TransactionLookupStageError::TransactionLookup { block: end_block },
+        ))?;
+
         let mut tx_cursor = tx.cursor_read::<tables::Transactions>()?;
+        let tx_walker =
+            tx_cursor.walk_range(first_block.first_tx_num()..=last_block.last_tx_num())?;
 
-        // Walk over block bodies within a specified range.
-        let bodies = block_meta_cursor.walk_range(start_block..=end_block)?;
+        let chunk_size = 100_000 / rayon::current_num_threads();
+        let mut channels = Vec::with_capacity(chunk_size);
+        let mut transaction_count = 0;
 
-        let mut total_transactions = 0;
-        let mut tx_ranges = Vec::with_capacity((end_block - start_block) as usize);
+        for chunk in &tx_walker.chunks(chunk_size) {
+            let (tx, rx) = mpsc::unbounded_channel();
+            channels.push(rx);
 
-        for block_meta_entry in bodies {
-            let (_, block_meta) = block_meta_entry?;
-            total_transactions += block_meta.tx_count;
-            tx_ranges.push(block_meta.tx_num_range());
+            // Note: Unfortunate side-effect of how chunk is designed in itertools (it is not Send)
+            let chunk: Vec<_> = chunk.collect();
+            transaction_count += chunk.len();
+
+            // closure that will calculate the TxHash
+            let calculate_hash =
+                |entry: Result<(TxNumber, TransactionSignedNoHash), reth_db::Error>,
+                 rlp_buf: &mut Vec<u8>|
+                 -> Result<(H256, u64), Box<StageError>> {
+                    let (tx_id, tx) = entry.map_err(|e| Box::new(e.into()))?;
+                    tx.transaction.encode_with_signature(&tx.signature, rlp_buf, false);
+                    Ok((H256(keccak256(rlp_buf)), tx_id))
+                };
+
+            // Spawn the task onto the global rayon pool
+            // This task will send the results through the channel after it has calculated the hash.
+            rayon::spawn(move || {
+                let mut rlp_buf = Vec::with_capacity(128);
+                for entry in chunk {
+                    rlp_buf.clear();
+                    let _ = tx.send(calculate_hash(entry, &mut rlp_buf));
+                }
+            });
         }
 
-        // Collect transactions for each body
-        let mut tx_list = Vec::with_capacity(total_transactions as usize);
-        for tx_num_range in tx_ranges {
-            for tx_entry in tx_cursor.walk_range(tx_num_range)? {
-                let (id, transaction) = tx_entry?;
-                tx_list.push((transaction.hash(), id));
+        let mut tx_list = Vec::with_capacity(transaction_count);
+
+        // Iterate over channels and append the tx hashes to be sorted out later
+        for mut channel in channels {
+            while let Some(tx) = channel.recv().await {
+                let (tx_hash, tx_id) = tx.map_err(|boxed| *boxed)?;
+                tx_list.push((tx_hash, tx_id));
             }
         }
 
@@ -106,9 +143,8 @@ impl<DB: Database> Stage<DB> for TransactionLookupStage {
             }
         }
 
-        let done = !capped;
-        info!(target: "sync::stages::transaction_lookup", stage_progress = end_block, done, "Sync iteration finished");
-        Ok(ExecOutput { done, stage_progress: end_block })
+        info!(target: "sync::stages::transaction_lookup", stage_progress = end_block, is_final_range, "Sync iteration finished");
+        Ok(ExecOutput { done: is_final_range, stage_progress: end_block })
     }
 
     /// Unwind the stage.
@@ -132,7 +168,7 @@ impl<DB: Database> Stage<DB> for TransactionLookupStage {
             for tx_id in body.tx_num_range() {
                 // First delete the transaction and hash to id mapping
                 if let Some((_, transaction)) = transaction_cursor.seek_exact(tx_id)? {
-                    if tx_hash_number_cursor.seek_exact(transaction.hash)?.is_some() {
+                    if tx_hash_number_cursor.seek_exact(transaction.hash())?.is_some() {
                         tx_hash_number_cursor.delete_current()?;
                     }
                 }
@@ -140,6 +176,18 @@ impl<DB: Database> Stage<DB> for TransactionLookupStage {
         }
 
         Ok(UnwindOutput { stage_progress: input.unwind_to })
+    }
+}
+
+#[derive(Error, Debug)]
+enum TransactionLookupStageError {
+    #[error("Transaction lookup failed to find block {block}.")]
+    TransactionLookup { block: BlockNumber },
+}
+
+impl From<TransactionLookupStageError> for StageError {
+    fn from(error: TransactionLookupStageError) -> Self {
+        StageError::Fatal(Box::new(error))
     }
 }
 
@@ -254,7 +302,7 @@ mod tests {
         /// 2. If the is no requested block entry in the bodies table,
         ///    but [tables::TxHashNumber] is not empty.
         fn ensure_no_hash_by_block(&self, number: BlockNumber) -> Result<(), TestRunnerError> {
-            let body_result = self.tx.inner().get_block_meta(number);
+            let body_result = self.tx.inner().block_body_indices(number);
             match body_result {
                 Ok(body) => self.tx.ensure_no_entry_above_by_value::<tables::TxHashNumber, _>(
                     body.last_tx_num(),
@@ -286,9 +334,9 @@ mod tests {
 
         fn seed_execution(&mut self, input: ExecInput) -> Result<Self::Seed, TestRunnerError> {
             let stage_progress = input.stage_progress.unwrap_or_default();
-            let end = input.previous_stage_progress() + 1;
+            let end = input.previous_stage_progress();
 
-            let blocks = random_block_range(stage_progress..end, H256::zero(), 0..2);
+            let blocks = random_block_range(stage_progress..=end, H256::zero(), 0..2);
             self.tx.insert_blocks(blocks.iter(), None)?;
             Ok(blocks)
         }
@@ -317,7 +365,7 @@ mod tests {
                                 .expect("no transaction entry");
                             assert_eq!(
                                 Some(tx_id),
-                                tx.get::<tables::TxHashNumber>(transaction.hash)?,
+                                tx.get::<tables::TxHashNumber>(transaction.hash())?,
                             );
                         }
                     }

@@ -125,11 +125,12 @@ where
     /// Note:
     /// > Client software MAY stop the corresponding build process after serving this call.
     pub async fn get_payload_v1(&self, payload_id: PayloadId) -> EngineApiResult<ExecutionPayload> {
-        self.payload_store
+        Ok(self
+            .payload_store
             .get_payload(payload_id)
             .await
-            .map(|payload| (*payload).clone().into_v1_payload())
-            .ok_or(EngineApiError::UnknownPayload)
+            .ok_or(EngineApiError::UnknownPayload)?
+            .map(|payload| (*payload).clone().into_v1_payload())?)
     }
 
     /// Returns the most recent version of the payload that is available in the corresponding
@@ -143,11 +144,12 @@ where
         &self,
         payload_id: PayloadId,
     ) -> EngineApiResult<ExecutionPayloadEnvelope> {
-        self.payload_store
+        Ok(self
+            .payload_store
             .get_payload(payload_id)
             .await
-            .map(|payload| (*payload).clone().into_v2_payload())
-            .ok_or(EngineApiError::UnknownPayload)
+            .ok_or(EngineApiError::UnknownPayload)?
+            .map(|payload| (*payload).clone().into_v2_payload())?)
     }
 
     /// Called to retrieve execution payload bodies by range.
@@ -484,7 +486,7 @@ mod tests {
             let (handle, api) = setup_engine_api();
 
             let (start, count) = (1, 10);
-            let blocks = random_block_range(start..start + count, H256::default(), 0..2);
+            let blocks = random_block_range(start..=start + count - 1, H256::default(), 0..2);
             handle.client.extend_blocks(blocks.iter().cloned().map(|b| (b.hash(), b.unseal())));
 
             let expected =
@@ -499,7 +501,7 @@ mod tests {
             let (handle, api) = setup_engine_api();
 
             let (start, count) = (1, 100);
-            let blocks = random_block_range(start..start + count, H256::default(), 0..2);
+            let blocks = random_block_range(start..=start + count - 1, H256::default(), 0..2);
 
             // Insert only blocks in ranges 1-25 and 50-75
             let first_missing_range = 26..=50;

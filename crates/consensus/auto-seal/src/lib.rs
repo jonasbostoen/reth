@@ -60,7 +60,7 @@ impl Consensus for AutoSealConsensus {
 
     fn validate_header(
         &self,
-        _header: &SealedHeader,
+        _header: &Header,
         _total_difficulty: U256,
     ) -> Result<(), ConsensusError> {
         Ok(())
@@ -68,10 +68,6 @@ impl Consensus for AutoSealConsensus {
 
     fn pre_validate_block(&self, _block: &SealedBlock) -> Result<(), ConsensusError> {
         Ok(())
-    }
-
-    fn has_block_reward(&self, _total_difficulty: U256, _difficulty: U256) -> bool {
-        false
     }
 }
 

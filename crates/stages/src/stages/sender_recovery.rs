@@ -1,7 +1,4 @@
-use crate::{
-    exec_or_return, ExecAction, ExecInput, ExecOutput, Stage, StageError, StageId, UnwindInput,
-    UnwindOutput,
-};
+use crate::{ExecInput, ExecOutput, Stage, StageError, StageId, UnwindInput, UnwindOutput};
 use itertools::Itertools;
 use reth_db::{
     cursor::{DbCursorRO, DbCursorRW},
@@ -10,7 +7,7 @@ use reth_db::{
     transaction::{DbTx, DbTxMut},
     RawKey, RawTable, RawValue,
 };
-use reth_primitives::{TransactionSigned, TxNumber, H160};
+use reth_primitives::{keccak256, TransactionSignedNoHash, TxNumber, H160};
 use reth_provider::Transaction;
 use std::fmt::Debug;
 use thiserror::Error;
@@ -53,20 +50,22 @@ impl<DB: Database> Stage<DB> for SenderRecoveryStage {
         tx: &mut Transaction<'_, DB>,
         input: ExecInput,
     ) -> Result<ExecOutput, StageError> {
-        let ((start_block, end_block), capped) =
-            exec_or_return!(input, self.commit_threshold, "sync::stages::sender_recovery");
-        let done = !capped;
+        let (range, is_final_range) = input.next_block_range_with_threshold(self.commit_threshold);
+        if range.is_empty() {
+            return Ok(ExecOutput::done(*range.end()))
+        }
+        let (start_block, end_block) = range.clone().into_inner();
 
         // Look up the start index for the transaction range
-        let first_tx_num = tx.get_block_meta(start_block)?.first_tx_num();
+        let first_tx_num = tx.block_body_indices(start_block)?.first_tx_num();
 
         // Look up the end index for transaction range (inclusive)
-        let last_tx_num = tx.get_block_meta(end_block)?.last_tx_num();
+        let last_tx_num = tx.block_body_indices(end_block)?.last_tx_num();
 
         // No transactions to walk over
         if first_tx_num > last_tx_num {
             info!(target: "sync::stages::sender_recovery", first_tx_num, last_tx_num, "Target transaction already reached");
-            return Ok(ExecOutput { stage_progress: end_block, done })
+            return Ok(ExecOutput { stage_progress: end_block, done: is_final_range })
         }
 
         // Acquire the cursor for inserting elements
@@ -101,16 +100,20 @@ impl<DB: Database> Stage<DB> for SenderRecoveryStage {
 
             // closure that would recover signer. Used as utility to wrap result
             let recover = |entry: Result<
-                (RawKey<TxNumber>, RawValue<TransactionSigned>),
+                (RawKey<TxNumber>, RawValue<TransactionSignedNoHash>),
                 reth_db::Error,
-            >|
+            >,
+                           rlp_buf: &mut Vec<u8>|
              -> Result<(u64, H160), Box<StageError>> {
                 let (tx_id, transaction) = entry.map_err(|e| Box::new(e.into()))?;
                 let tx_id = tx_id.key().expect("key to be formated");
-                let transaction = transaction.value().expect("value to be formated");
-                let sender = transaction.recover_signer().ok_or(StageError::from(
-                    SenderRecoveryStageError::SenderRecovery { tx: tx_id },
-                ))?;
+
+                let tx = transaction.value().expect("value to be formated");
+                tx.transaction.encode_without_signature(rlp_buf);
+
+                let sender = tx.signature.recover_signer(keccak256(rlp_buf)).ok_or(
+                    StageError::from(SenderRecoveryStageError::SenderRecovery { tx: tx_id }),
+                )?;
 
                 Ok((tx_id, sender))
             };
@@ -118,8 +121,10 @@ impl<DB: Database> Stage<DB> for SenderRecoveryStage {
             // Spawn the sender recovery task onto the global rayon pool
             // This task will send the results through the channel after it recovered the senders.
             rayon::spawn(move || {
+                let mut rlp_buf = Vec::with_capacity(128);
                 for entry in chunk {
-                    let _ = tx.send(recover(entry));
+                    rlp_buf.clear();
+                    let _ = tx.send(recover(entry, &mut rlp_buf));
                 }
             });
         }
@@ -131,8 +136,8 @@ impl<DB: Database> Stage<DB> for SenderRecoveryStage {
             }
         }
 
-        info!(target: "sync::stages::sender_recovery", stage_progress = end_block, done, "Sync iteration finished");
-        Ok(ExecOutput { stage_progress: end_block, done })
+        info!(target: "sync::stages::sender_recovery", stage_progress = end_block, is_final_range, "Sync iteration finished");
+        Ok(ExecOutput { stage_progress: end_block, done: is_final_range })
     }
 
     /// Unwind the stage.
@@ -143,7 +148,7 @@ impl<DB: Database> Stage<DB> for SenderRecoveryStage {
     ) -> Result<UnwindOutput, StageError> {
         info!(target: "sync::stages::sender_recovery", to_block = input.unwind_to, "Unwinding");
         // Lookup latest tx id that we should unwind to
-        let latest_tx_id = tx.get_block_meta(input.unwind_to)?.last_tx_num();
+        let latest_tx_id = tx.block_body_indices(input.unwind_to)?.last_tx_num();
         tx.unwind_table_by_num::<tables::TxSenders>(latest_tx_id)?;
         Ok(UnwindOutput { stage_progress: input.unwind_to })
     }
@@ -166,7 +171,7 @@ impl From<SenderRecoveryStageError> for StageError {
 mod tests {
     use assert_matches::assert_matches;
     use reth_interfaces::test_utils::generators::{random_block, random_block_range};
-    use reth_primitives::{BlockNumber, SealedBlock, H256};
+    use reth_primitives::{BlockNumber, SealedBlock, TransactionSigned, H256};
 
     use super::*;
     use crate::test_utils::{
@@ -190,7 +195,7 @@ mod tests {
 
         // Insert blocks with a single transaction at block `stage_progress + 10`
         let non_empty_block_number = stage_progress + 10;
-        let blocks = (stage_progress..input.previous_stage_progress() + 1)
+        let blocks = (stage_progress..=input.previous_stage_progress())
             .map(|number| {
                 random_block(number, None, Some((number == non_empty_block_number) as u8), None)
             })
@@ -274,7 +279,7 @@ mod tests {
         /// 2. If the is no requested block entry in the bodies table,
         ///    but [tables::TxSenders] is not empty.
         fn ensure_no_senders_by_block(&self, block: BlockNumber) -> Result<(), TestRunnerError> {
-            let body_result = self.tx.inner().get_block_meta(block);
+            let body_result = self.tx.inner().block_body_indices(block);
             match body_result {
                 Ok(body) => self
                     .tx
@@ -305,9 +310,9 @@ mod tests {
 
         fn seed_execution(&mut self, input: ExecInput) -> Result<Self::Seed, TestRunnerError> {
             let stage_progress = input.stage_progress.unwrap_or_default();
-            let end = input.previous_stage_progress() + 1;
+            let end = input.previous_stage_progress();
 
-            let blocks = random_block_range(stage_progress..end, H256::zero(), 0..2);
+            let blocks = random_block_range(stage_progress..=end, H256::zero(), 0..2);
             self.tx.insert_blocks(blocks.iter(), None)?;
             Ok(blocks)
         }
@@ -331,9 +336,10 @@ mod tests {
 
                     while let Some((_, body)) = body_cursor.next()? {
                         for tx_id in body.tx_num_range() {
-                            let transaction = tx
+                            let transaction: TransactionSigned = tx
                                 .get::<tables::Transactions>(tx_id)?
-                                .expect("no transaction entry");
+                                .expect("no transaction entry")
+                                .into();
                             let signer =
                                 transaction.recover_signer().expect("failed to recover signer");
                             assert_eq!(Some(signer), tx.get::<tables::TxSenders>(tx_id)?);

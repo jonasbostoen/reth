@@ -48,7 +48,7 @@ pub use chain::{
     AllGenesisFormats, Chain, ChainInfo, ChainSpec, ChainSpecBuilder, ForkCondition, GOERLI,
     MAINNET, SEPOLIA,
 };
-pub use checkpoints::{AccountHashingCheckpoint, ProofCheckpoint, StorageHashingCheckpoint};
+pub use checkpoints::{AccountHashingCheckpoint, MerkleCheckpoint, StorageHashingCheckpoint};
 pub use constants::{
     EMPTY_OMMER_ROOT, GOERLI_GENESIS, KECCAK_EMPTY, MAINNET_GENESIS, SEPOLIA_GENESIS,
 };
@@ -72,8 +72,8 @@ pub use transaction::{
     util::secp256k1::sign_message, AccessList, AccessListItem, AccessListWithGasUsed,
     FromRecoveredTransaction, IntoRecoveredTransaction, InvalidTransactionError, Signature,
     Transaction, TransactionKind, TransactionMeta, TransactionSigned, TransactionSignedEcRecovered,
-    TxEip1559, TxEip2930, TxLegacy, TxType, EIP1559_TX_TYPE_ID, EIP2930_TX_TYPE_ID,
-    LEGACY_TX_TYPE_ID,
+    TransactionSignedNoHash, TxEip1559, TxEip2930, TxLegacy, TxType, EIP1559_TX_TYPE_ID,
+    EIP2930_TX_TYPE_ID, LEGACY_TX_TYPE_ID,
 };
 pub use withdrawal::Withdrawal;
 
@@ -95,8 +95,6 @@ pub type ChainId = u64;
 pub type StorageKey = H256;
 /// An account storage value.
 pub type StorageValue = U256;
-/// The ID of block/transaction transition (represents state transition)
-pub type TransitionId = u64;
 /// Solidity contract functions are addressed using the first four byte of the Keccak-256 hash of
 /// their signature
 pub type Selector = [u8; 4];

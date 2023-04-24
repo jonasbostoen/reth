@@ -1,8 +1,8 @@
 //! Database debugging tool
 use crate::{
+    args::StageEnum,
     dirs::{DbPath, MaybePlatformPath},
     utils::DbTool,
-    StageEnum,
 };
 use clap::Parser;
 use reth_db::{
@@ -54,7 +54,7 @@ pub struct Command {
 
 impl Command {
     /// Execute `db` command
-    pub async fn execute(&self) -> eyre::Result<()> {
+    pub async fn execute(self) -> eyre::Result<()> {
         // add network name to db directory
         let db_path = self.db.unwrap_or_chain_default(self.chain.chain);
 
@@ -98,6 +98,7 @@ impl Command {
                     tx.clear::<tables::StoragesTrie>()?;
                     tx.put::<tables::SyncStage>(MERKLE_EXECUTION.0.to_string(), 0)?;
                     tx.put::<tables::SyncStage>(MERKLE_UNWIND.0.to_string(), 0)?;
+                    tx.delete::<tables::SyncStageProgress>(MERKLE_EXECUTION.0.into(), None)?;
                     Ok::<_, eyre::Error>(())
                 })??;
             }

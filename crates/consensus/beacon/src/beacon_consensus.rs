@@ -2,7 +2,7 @@
 use reth_consensus_common::validation;
 use reth_interfaces::consensus::{Consensus, ConsensusError};
 use reth_primitives::{
-    Chain, ChainSpec, Hardfork, SealedBlock, SealedHeader, EMPTY_OMMER_ROOT, U256,
+    Chain, ChainSpec, Hardfork, Header, SealedBlock, SealedHeader, EMPTY_OMMER_ROOT, U256,
 };
 use std::sync::Arc;
 
@@ -36,7 +36,7 @@ impl Consensus for BeaconConsensus {
 
     fn validate_header(
         &self,
-        header: &SealedHeader,
+        header: &Header,
         total_difficulty: U256,
     ) -> Result<(), ConsensusError> {
         if self.chain_spec.fork(Hardfork::Paris).active_at_ttd(total_difficulty, header.difficulty)
@@ -79,35 +79,16 @@ impl Consensus for BeaconConsensus {
     fn pre_validate_block(&self, block: &SealedBlock) -> Result<(), ConsensusError> {
         validation::validate_block_standalone(block, &self.chain_spec)
     }
-
-    fn has_block_reward(&self, total_difficulty: U256, difficulty: U256) -> bool {
-        !self.chain_spec.fork(Hardfork::Paris).active_at_ttd(total_difficulty, difficulty)
-    }
 }
 
 /// Validates the header's extradata according to the beacon consensus rules.
 ///
 /// From yellow paper: extraData: An arbitrary byte array containing data relevant to this block.
 /// This must be 32 bytes or fewer; formally Hx.
-fn validate_header_extradata(header: &SealedHeader) -> Result<(), ConsensusError> {
+fn validate_header_extradata(header: &Header) -> Result<(), ConsensusError> {
     if header.extra_data.len() > 32 {
         Err(ConsensusError::ExtraDataExceedsMax { len: header.extra_data.len() })
     } else {
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use super::BeaconConsensus;
-    use reth_interfaces::consensus::Consensus;
-    use reth_primitives::{ChainSpecBuilder, U256};
-    use std::sync::Arc;
-
-    #[test]
-    fn test_has_block_reward_before_paris() {
-        let chain_spec = Arc::new(ChainSpecBuilder::mainnet().build());
-        let consensus = BeaconConsensus::new(chain_spec);
-        assert!(consensus.has_block_reward(U256::ZERO, U256::ZERO));
     }
 }
