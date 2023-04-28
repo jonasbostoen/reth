@@ -7,7 +7,7 @@ use crate::{
     error::PayloadBuilderError, metrics::PayloadBuilderServiceMetrics, traits::PayloadJobGenerator,
     BuiltPayload, PayloadBuilderAttributes, PayloadJob,
 };
-use futures_util::stream::{StreamExt, TryStreamExt};
+use futures_util::{future::FutureExt, StreamExt};
 use reth_rpc_types::engine::PayloadId;
 use std::{
     future::Future,
@@ -161,33 +161,23 @@ where
             // we poll all jobs first, so we always have the latest payload that we can report if
             // requests
             // we don't care about the order of the jobs, so we can just swap_remove them
-            'jobs: for idx in (0..this.payload_jobs.len()).rev() {
+            for idx in (0..this.payload_jobs.len()).rev() {
                 let (mut job, id) = this.payload_jobs.swap_remove(idx);
 
                 // drain better payloads from the job
-                loop {
-                    match job.try_poll_next_unpin(cx) {
-                        Poll::Ready(Some(Ok(payload))) => {
-                            this.metrics.set_active_jobs(this.payload_jobs.len());
-                            trace!(?payload, %id, "new payload");
-                        }
-                        Poll::Ready(Some(Err(err))) => {
-                            warn!(?err, %id, "payload job failed; resolving payload");
-                            this.metrics.set_active_jobs(this.payload_jobs.len());
-                            this.metrics.inc_failed_jobs();
-                            continue 'jobs
-                        }
-                        Poll::Ready(None) => {
-                            // job is done
-                            trace!(?id, "payload job finished");
-                            this.metrics.set_active_jobs(this.payload_jobs.len());
-                            continue 'jobs
-                        }
-                        Poll::Pending => {
-                            // still pending, put it back
-                            this.payload_jobs.push((job, id));
-                            continue 'jobs
-                        }
+                match job.poll_unpin(cx) {
+                    Poll::Ready(Ok(_)) => {
+                        this.metrics.set_active_jobs(this.payload_jobs.len());
+                        trace!(%id, "payload job finished");
+                    }
+                    Poll::Ready(Err(err)) => {
+                        warn!(?err, ?id, "payload job failed; resolving payload");
+                        this.metrics.inc_failed_jobs();
+                        this.metrics.set_active_jobs(this.payload_jobs.len());
+                    }
+                    Poll::Pending => {
+                        // still pending, put it back
+                        this.payload_jobs.push((job, id));
                     }
                 }
             }
@@ -203,7 +193,9 @@ where
                         let id = attr.payload_id();
                         let mut res = Ok(id);
 
-                        if !this.contains_payload(id) {
+                        if this.contains_payload(id) {
+                            warn!(%id, parent = ?attr.parent, "payload job already in progress");
+                        } else {
                             // no job for this payload yet, create one
                             match this.generator.new_payload_job(attr) {
                                 Ok(job) => {

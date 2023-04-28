@@ -23,10 +23,12 @@ use std::{
     collections::{BTreeMap, HashSet},
     ops::RangeBounds,
 };
+use tracing::trace;
 
 mod database;
 mod post_state_provider;
 mod state;
+use crate::traits::BlockSource;
 pub use database::*;
 pub use post_state_provider::PostStateProvider;
 
@@ -99,6 +101,10 @@ where
         self.database.chain_info()
     }
 
+    fn best_block_number(&self) -> Result<BlockNumber> {
+        self.database.best_block_number()
+    }
+
     fn convert_block_number(&self, num: BlockNumberOrTag) -> Result<Option<BlockNumber>> {
         let num = match num {
             BlockNumberOrTag::Latest => self.chain_info()?.best_number,
@@ -136,6 +142,25 @@ where
     DB: Database,
     Tree: BlockchainTreeViewer + Send + Sync,
 {
+    fn find_block_by_hash(&self, hash: H256, source: BlockSource) -> Result<Option<Block>> {
+        let block = match source {
+            BlockSource::Any => {
+                // check pending source first
+                // Note: it's fine to return the unsealed block because the caller already has the
+                // hash
+                let mut block = self.tree.block_by_hash(hash).map(|block| block.unseal());
+                if block.is_none() {
+                    block = self.database.block_by_hash(hash)?;
+                }
+                block
+            }
+            BlockSource::Pending => self.tree.block_by_hash(hash).map(|block| block.unseal()),
+            BlockSource::Database => self.database.block_by_hash(hash)?,
+        };
+
+        Ok(block)
+    }
+
     fn block(&self, id: BlockId) -> Result<Option<Block>> {
         self.database.block(id)
     }
@@ -259,19 +284,36 @@ where
 {
     /// Storage provider for latest block
     fn latest(&self) -> Result<StateProviderBox<'_>> {
+        trace!(target: "providers::blockchain", "Getting latest block state provider");
         self.database.latest()
     }
 
     fn history_by_block_number(&self, block_number: BlockNumber) -> Result<StateProviderBox<'_>> {
+        trace!(target: "providers::blockchain", ?block_number, "Getting history by block number");
         self.database.history_by_block_number(block_number)
     }
 
     fn history_by_block_hash(&self, block_hash: BlockHash) -> Result<StateProviderBox<'_>> {
+        trace!(target: "providers::blockchain", ?block_hash, "Getting history by block hash");
         self.database.history_by_block_hash(block_hash)
+    }
+
+    fn state_by_block_hash(&self, block: BlockHash) -> Result<StateProviderBox<'_>> {
+        trace!(target: "providers::blockchain", ?block, "Getting state by block hash");
+
+        // check tree first
+        if let Some(pending) = self.tree.find_pending_state_provider(block) {
+            trace!(target: "providers::blockchain", "Returning pending state provider");
+            return self.pending_with_provider(pending)
+        }
+        // not found in tree, check database
+        self.history_by_block_hash(block)
     }
 
     /// Storage provider for pending state.
     fn pending(&self) -> Result<StateProviderBox<'_>> {
+        trace!(target: "providers::blockchain", "Getting provider for pending state");
+
         if let Some(block) = self.tree.pending_block() {
             let pending = self.tree.pending_state_provider(block.hash)?;
             return self.pending_with_provider(pending)
@@ -284,6 +326,8 @@ where
         post_state_data: Box<dyn PostStateDataProvider>,
     ) -> Result<StateProviderBox<'_>> {
         let canonical_fork = post_state_data.canonical_fork();
+        trace!(target: "providers::blockchain", ?canonical_fork, "Returning post state provider");
+
         let state_provider = self.history_by_block_hash(canonical_fork.hash)?;
         let post_state_provider = PostStateProvider::new(state_provider, post_state_data);
         Ok(Box::new(post_state_provider))
@@ -351,11 +395,11 @@ where
     DB: Send + Sync,
     Tree: BlockchainTreePendingStateProvider,
 {
-    fn pending_state_provider(
+    fn find_pending_state_provider(
         &self,
         block_hash: BlockHash,
-    ) -> Result<Box<dyn PostStateDataProvider>> {
-        self.tree.pending_state_provider(block_hash)
+    ) -> Option<Box<dyn PostStateDataProvider>> {
+        self.tree.find_pending_state_provider(block_hash)
     }
 }
 

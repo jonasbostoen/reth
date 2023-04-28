@@ -221,6 +221,7 @@ where
 
                 match self.sessions.on_incoming(stream, remote_addr) {
                     Ok(session_id) => {
+                        trace!(target: "net", ?remote_addr, "Incoming connection");
                         return Some(SwarmEvent::IncomingTcpConnection { session_id, remote_addr })
                     }
                     Err(err) => {
@@ -283,7 +284,7 @@ where
 
     /// Checks if the node's network connection state is 'ShuttingDown'
     #[inline]
-    fn is_shutting_down(&self) -> bool {
+    pub(crate) fn is_shutting_down(&self) -> bool {
         matches!(self.net_connection_state, NetworkConnectionState::ShuttingDown)
     }
 }

@@ -146,6 +146,9 @@ where
     /// Max block after which the consensus engine would terminate the sync. Used for debugging
     /// purposes.
     max_block: Option<BlockNumber>,
+    /// If true, the engine will run the pipeline continuously, regardless of whether or not there
+    /// is a new fork choice state.
+    continuous: bool,
     /// The payload store.
     payload_builder: PayloadBuilderHandle,
     /// Consensus engine metrics.
@@ -166,6 +169,7 @@ where
         pipeline: Pipeline<DB, U>,
         blockchain_tree: BT,
         max_block: Option<BlockNumber>,
+        continuous: bool,
         payload_builder: PayloadBuilderHandle,
     ) -> (Self, BeaconConsensusEngineHandle) {
         let (to_engine, rx) = mpsc::unbounded_channel();
@@ -175,6 +179,7 @@ where
             pipeline,
             blockchain_tree,
             max_block,
+            continuous,
             payload_builder,
             to_engine,
             rx,
@@ -190,6 +195,7 @@ where
         pipeline: Pipeline<DB, U>,
         blockchain_tree: BT,
         max_block: Option<BlockNumber>,
+        continuous: bool,
         payload_builder: PayloadBuilderHandle,
         to_engine: UnboundedSender<BeaconEngineMessage>,
         rx: UnboundedReceiver<BeaconEngineMessage>,
@@ -205,6 +211,7 @@ where
             forkchoice_state: None,
             next_action: BeaconEngineAction::None,
             max_block,
+            continuous,
             payload_builder,
             metrics: Metrics::default(),
         };
@@ -241,7 +248,7 @@ where
         state: ForkchoiceState,
         attrs: Option<PayloadAttributes>,
     ) -> Result<OnForkChoiceUpdated, BeaconEngineError> {
-        trace!(target: "consensus::engine", ?state, "Received new forkchoice state");
+        trace!(target: "consensus::engine", ?state, "Received new forkchoice state update");
         if state.head_block_hash.is_zero() {
             return Ok(OnForkChoiceUpdated::invalid_state())
         }
@@ -318,7 +325,7 @@ where
     fn process_payload_attributes(
         &self,
         attrs: PayloadAttributes,
-        header: Header,
+        head: Header,
         state: ForkchoiceState,
     ) -> OnForkChoiceUpdated {
         // 7. Client software MUST ensure that payloadAttributes.timestamp is
@@ -327,7 +334,7 @@ where
         //    software MUST respond with -38003: `Invalid payload attributes` and
         //    MUST NOT begin a payload build process. In such an event, the
         //    forkchoiceState update MUST NOT be rolled back.
-        if attrs.timestamp <= header.timestamp.into() {
+        if attrs.timestamp <= head.timestamp.into() {
             return OnForkChoiceUpdated::invalid_payload_attributes()
         }
 
@@ -336,7 +343,7 @@ where
         //    if payloadAttributes is not null and the forkchoice state has been
         //    updated successfully. The build process is specified in the Payload
         //    building section.
-        let attributes = PayloadBuilderAttributes::new(header.parent_hash, attrs);
+        let attributes = PayloadBuilderAttributes::new(state.head_block_hash, attrs);
 
         // send the payload to the builder and return the receiver for the pending payload id,
         // initiating payload job is handled asynchronously
@@ -421,13 +428,21 @@ where
         forkchoice_state: ForkchoiceState,
     ) -> PipelineState<DB, U> {
         let next_action = std::mem::take(&mut self.next_action);
-        if let BeaconEngineAction::RunPipeline(target) = next_action {
+
+        let (tip, should_run_pipeline) = match next_action {
+            BeaconEngineAction::RunPipeline(target) => {
+                let tip = match target {
+                    PipelineTarget::Head => forkchoice_state.head_block_hash,
+                    PipelineTarget::Safe => forkchoice_state.safe_block_hash,
+                };
+                (Some(tip), true)
+            }
+            BeaconEngineAction::None => (None, self.continuous),
+        };
+
+        if should_run_pipeline {
             self.metrics.pipeline_runs.increment(1);
-            let tip = match target {
-                PipelineTarget::Head => forkchoice_state.head_block_hash,
-                PipelineTarget::Safe => forkchoice_state.safe_block_hash,
-            };
-            trace!(target: "consensus::engine", ?tip, "Starting the pipeline");
+            trace!(target: "consensus::engine", ?tip, continuous = tip.is_none(), "Starting the pipeline");
             let (tx, rx) = oneshot::channel();
             let db = self.db.clone();
             self.task_spawner.spawn_critical_blocking(
@@ -748,6 +763,7 @@ mod tests {
             pipeline,
             tree,
             None,
+            false,
             payload_builder,
         );
 

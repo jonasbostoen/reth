@@ -1,7 +1,8 @@
 use crate::{
-    traits::ReceiptProvider, AccountProvider, BlockHashProvider, BlockIdProvider, BlockProvider,
-    EvmEnvProvider, HeaderProvider, StateProvider, StateProviderBox, StateProviderFactory,
-    TransactionsProvider,
+    traits::{BlockSource, ReceiptProvider},
+    AccountProvider, BlockHashProvider, BlockIdProvider, BlockProvider, EvmEnvProvider,
+    HeaderProvider, PostState, StateProvider, StateProviderBox, StateProviderFactory,
+    StateRootProvider, TransactionsProvider,
 };
 use reth_interfaces::Result;
 use reth_primitives::{
@@ -33,12 +34,20 @@ impl BlockIdProvider for NoopProvider {
         Ok(ChainInfo::default())
     }
 
+    fn best_block_number(&self) -> Result<BlockNumber> {
+        Ok(0)
+    }
+
     fn block_number(&self, _hash: H256) -> Result<Option<BlockNumber>> {
         Ok(None)
     }
 }
 
 impl BlockProvider for NoopProvider {
+    fn find_block_by_hash(&self, hash: H256, _source: BlockSource) -> Result<Option<Block>> {
+        self.block(hash.into())
+    }
+
     fn block(&self, _id: BlockId) -> Result<Option<Block>> {
         Ok(None)
     }
@@ -126,6 +135,12 @@ impl AccountProvider for NoopProvider {
     }
 }
 
+impl StateRootProvider for NoopProvider {
+    fn state_root(&self, _post_state: PostState) -> Result<H256> {
+        todo!()
+    }
+}
+
 impl StateProvider for NoopProvider {
     fn storage(&self, _account: Address, _storage_key: StorageKey) -> Result<Option<StorageValue>> {
         Ok(None)
@@ -194,6 +209,10 @@ impl StateProviderFactory for NoopProvider {
     }
 
     fn history_by_block_hash(&self, _block: BlockHash) -> Result<StateProviderBox<'_>> {
+        Ok(Box::new(*self))
+    }
+
+    fn state_by_block_hash(&self, _block: BlockHash) -> Result<StateProviderBox<'_>> {
         Ok(Box::new(*self))
     }
 

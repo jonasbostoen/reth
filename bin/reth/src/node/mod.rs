@@ -40,7 +40,7 @@ use reth_interfaces::{
 use reth_network::{error::NetworkError, NetworkConfig, NetworkHandle, NetworkManager};
 use reth_network_api::NetworkInfo;
 use reth_primitives::{BlockHashOrNumber, Chain, ChainSpec, Head, Header, SealedHeader, H256};
-use reth_provider::{BlockProvider, HeaderProvider, ShareableDatabase};
+use reth_provider::{BlockProvider, CanonStateSubscriptions, HeaderProvider, ShareableDatabase};
 use reth_revm::Factory;
 use reth_revm_inspectors::stack::Hook;
 use reth_rpc_engine_api::EngineApi;
@@ -158,7 +158,7 @@ impl Command {
 
         debug!(target: "reth::cli", chain=%self.chain.chain, genesis=?self.chain.genesis_hash(), "Initializing genesis");
 
-        init_genesis(db.clone(), self.chain.clone())?;
+        let genesis_hash = init_genesis(db.clone(), self.chain.clone())?;
 
         let consensus: Arc<dyn Consensus> = if self.auto_mine {
             debug!(target: "reth::cli", "Using auto seal");
@@ -197,6 +197,27 @@ impl Command {
         );
         info!(target: "reth::cli", "Transaction pool initialized");
 
+        // spawn txpool maintenance task
+        {
+            let pool = transaction_pool.clone();
+            let chain_events = blockchain_db.canonical_state_stream();
+            let client = blockchain_db.clone();
+            ctx.task_executor.spawn_critical(
+                "txpool maintenance task",
+                Box::pin(async move {
+                    let chain_events = chain_events.filter_map(|event| async move { event.ok() });
+                    pin_mut!(chain_events);
+                    reth_transaction_pool::maintain::maintain_transaction_pool(
+                        client,
+                        pool,
+                        chain_events,
+                    )
+                    .await
+                }),
+            );
+            debug!(target: "reth::cli", "Spawned txpool maintenance task");
+        }
+
         info!(target: "reth::cli", "Connecting to P2P network");
         let secret_key =
             get_secret_key(self.p2p_secret_key.unwrap_or_chain_default(self.chain.chain))?;
@@ -212,11 +233,24 @@ impl Command {
         info!(target: "reth::cli", peer_id = %network.peer_id(), local_addr = %network.local_addr(), "Connected to P2P network");
         debug!(target: "reth::cli", peer_id = ?network.peer_id(), "Full peer ID");
 
+        let (consensus_engine_tx, consensus_engine_rx) = unbounded_channel();
+
+        // Forward genesis as forkchoice state to the consensus engine.
+        // This will allow the downloader to start
         if self.debug.continuous {
             info!(target: "reth::cli", "Continuous sync mode enabled");
+            let (tip_tx, _tip_rx) = oneshot::channel();
+            let state = ForkchoiceState {
+                head_block_hash: genesis_hash,
+                finalized_block_hash: genesis_hash,
+                safe_block_hash: genesis_hash,
+            };
+            consensus_engine_tx.send(BeaconEngineMessage::ForkchoiceUpdated {
+                state,
+                payload_attrs: None,
+                tx: tip_tx,
+            })?;
         }
-
-        let (consensus_engine_tx, consensus_engine_rx) = unbounded_channel();
 
         // Forward the `debug.tip` as forkchoice state to the consensus engine.
         // This will initiate the sync up to the provided tip.
@@ -307,6 +341,7 @@ impl Command {
             pipeline,
             blockchain_tree.clone(),
             self.debug.max_block,
+            self.debug.continuous,
             payload_builder.clone(),
             consensus_engine_tx,
             consensus_engine_rx,

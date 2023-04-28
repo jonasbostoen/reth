@@ -8,7 +8,7 @@
 //! reth basic payload job generator
 
 use crate::metrics::PayloadBuilderMetrics;
-use futures_core::{ready, Stream};
+use futures_core::ready;
 use futures_util::FutureExt;
 use reth_payload_builder::{
     error::PayloadBuilderError, BuiltPayload, PayloadBuilderAttributes, PayloadJob,
@@ -19,10 +19,10 @@ use reth_primitives::{
     constants::{
         EMPTY_RECEIPTS, EMPTY_TRANSACTIONS, EMPTY_WITHDRAWALS, RETH_CLIENT_VERSION, SLOT_DURATION,
     },
-    proofs, Block, BlockId, BlockNumberOrTag, ChainSpec, Header, IntoRecoveredTransaction, Receipt,
-    SealedBlock, EMPTY_OMMER_ROOT, U256,
+    proofs, Block, BlockNumberOrTag, ChainSpec, Header, IntoRecoveredTransaction, Receipt,
+    SealedBlock, Withdrawal, EMPTY_OMMER_ROOT, H256, U256,
 };
-use reth_provider::{BlockProvider, PostState, StateProviderFactory};
+use reth_provider::{BlockProvider, BlockSource, PostState, StateProviderFactory};
 use reth_revm::{
     database::{State, SubState},
     env::tx_env_with_recovered,
@@ -34,7 +34,10 @@ use reth_revm::{
 use reth_rlp::Encodable;
 use reth_tasks::TaskSpawner;
 use reth_transaction_pool::TransactionPool;
-use revm::primitives::{BlockEnv, CfgEnv, Env, ResultAndState, SpecId};
+use revm::{
+    db::{CacheDB, DatabaseRef},
+    primitives::{BlockEnv, CfgEnv, EVMError, Env, InvalidTransaction, ResultAndState},
+};
 use std::{
     future::Future,
     pin::Pin,
@@ -46,7 +49,7 @@ use tokio::{
     sync::{oneshot, Semaphore},
     time::{Interval, Sleep},
 };
-use tracing::trace;
+use tracing::{debug, trace};
 
 mod metrics;
 
@@ -104,19 +107,21 @@ where
         &self,
         attributes: PayloadBuilderAttributes,
     ) -> Result<Self::Job, PayloadBuilderError> {
-        // TODO this needs to access the _pending_ state of the parent block hash
-
-        let block_id: BlockId = if attributes.parent.is_zero() {
+        let parent_block = if attributes.parent.is_zero() {
             // use latest block if parent is zero: genesis block
-            BlockNumberOrTag::Latest.into()
+            self.client
+                .block(BlockNumberOrTag::Latest.into())?
+                .ok_or_else(|| PayloadBuilderError::MissingParentBlock(attributes.parent))?
+                .seal_slow()
         } else {
-            attributes.parent.into()
-        };
+            let block = self
+                .client
+                .find_block_by_hash(attributes.parent, BlockSource::Any)?
+                .ok_or_else(|| PayloadBuilderError::MissingParentBlock(attributes.parent))?;
 
-        let parent_block = self
-            .client
-            .block(block_id)?
-            .ok_or_else(|| PayloadBuilderError::MissingParentBlock(attributes.parent))?;
+            // we already now the hash, so we can seal it
+            block.seal(attributes.parent)
+        };
 
         // configure evm env based on parent block
         let (initialized_cfg, initialized_block_env) =
@@ -125,7 +130,7 @@ where
         let config = PayloadConfig {
             initialized_block_env,
             initialized_cfg,
-            parent_block: Arc::new(parent_block.seal_slow()),
+            parent_block: Arc::new(parent_block),
             extra_data: self.config.extradata.clone(),
             attributes,
             chain_spec: Arc::clone(&self.chain_spec),
@@ -260,42 +265,44 @@ pub struct BasicPayloadJob<Client, Pool, Tasks> {
     metrics: PayloadBuilderMetrics,
 }
 
-impl<Client, Pool, Tasks> Stream for BasicPayloadJob<Client, Pool, Tasks>
+impl<Client, Pool, Tasks> Future for BasicPayloadJob<Client, Pool, Tasks>
 where
     Client: StateProviderFactory + Clone + Unpin + 'static,
     Pool: TransactionPool + Unpin + 'static,
     Tasks: TaskSpawner + Clone + 'static,
 {
-    type Item = Result<Arc<BuiltPayload>, PayloadBuilderError>;
+    type Output = Result<(), PayloadBuilderError>;
 
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
 
         // check if the deadline is reached
-        let deadline_reached = this.deadline.as_mut().poll(cx).is_ready();
+        if this.deadline.as_mut().poll(cx).is_ready() {
+            trace!("Payload building deadline reached");
+            return Poll::Ready(Ok(()))
+        }
 
         // check if the interval is reached
-        if this.interval.poll_tick(cx).is_ready() &&
-            this.pending_block.is_none() &&
-            !deadline_reached
-        {
-            let _ = this.interval.poll_tick(cx);
-            trace!("spawn new payload build task");
-            let (tx, rx) = oneshot::channel();
-            let client = this.client.clone();
-            let pool = this.pool.clone();
-            let cancel = Cancelled::default();
-            let _cancel = cancel.clone();
-            let guard = this.payload_task_guard.clone();
-            let payload_config = this.config.clone();
-            let best_payload = this.best_payload.clone();
-            this.metrics.inc_initiated_payload_builds();
-            this.executor.spawn_blocking(Box::pin(async move {
-                // acquire the permit for executing the task
-                let _permit = guard.0.acquire().await;
-                build_payload(client, pool, payload_config, cancel, best_payload, tx)
-            }));
-            this.pending_block = Some(PendingPayload { _cancel, payload: rx });
+        while this.interval.poll_tick(cx).is_ready() {
+            // start a new job if there is no pending block and we haven't reached the deadline
+            if this.pending_block.is_none() {
+                trace!("spawn new payload build task");
+                let (tx, rx) = oneshot::channel();
+                let client = this.client.clone();
+                let pool = this.pool.clone();
+                let cancel = Cancelled::default();
+                let _cancel = cancel.clone();
+                let guard = this.payload_task_guard.clone();
+                let payload_config = this.config.clone();
+                let best_payload = this.best_payload.clone();
+                this.metrics.inc_initiated_payload_builds();
+                this.executor.spawn_blocking(Box::pin(async move {
+                    // acquire the permit for executing the task
+                    let _permit = guard.0.acquire().await;
+                    build_payload(client, pool, payload_config, cancel, best_payload, tx)
+                }));
+                this.pending_block = Some(PendingPayload { _cancel, payload: rx });
+            }
         }
 
         // poll the pending block
@@ -318,19 +325,14 @@ where
                     }
                 }
                 Poll::Ready(Err(err)) => {
+                    // job failed, but we simply try again next interval
+                    trace!(?err, "payload build attempt failed");
                     this.metrics.inc_failed_payload_builds();
-                    this.interval.reset();
-                    return Poll::Ready(Some(Err(err)))
                 }
                 Poll::Pending => {
                     this.pending_block = Some(fut);
                 }
             }
-        }
-
-        if deadline_reached {
-            trace!("Payload building deadline reached");
-            return Poll::Ready(None)
         }
 
         Poll::Pending
@@ -455,9 +457,9 @@ fn build_payload<Pool, Client>(
             chain_spec,
         } = config;
 
-        // TODO this needs to access the _pending_ state of the parent block hash
-        let state = client.latest()?;
+        debug!(parent_hash=?parent_block.hash, parent_number=parent_block.number, "building new payload");
 
+        let state = client.state_by_block_hash(parent_block.hash)?;
         let mut db = SubState::new(State::new(state));
         let mut post_state = PostState::default();
 
@@ -465,18 +467,21 @@ fn build_payload<Pool, Client>(
         let block_gas_limit: u64 = initialized_block_env.gas_limit.try_into().unwrap_or(u64::MAX);
 
         let mut executed_txs = Vec::new();
-        let best_txs = pool.best_transactions();
+        let mut best_txs = pool.best_transactions();
 
         let mut total_fees = U256::ZERO;
         let base_fee = initialized_block_env.basefee.to::<u64>();
 
         let block_number = initialized_block_env.number.to::<u64>();
 
-        for tx in best_txs {
+        while let Some(pool_tx) = best_txs.next() {
             // ensure we still have capacity for this transaction
-            if cumulative_gas_used + tx.gas_limit() > block_gas_limit {
-                // TODO: try find transactions that can fit into the block
-                break
+            if cumulative_gas_used + pool_tx.gas_limit() > block_gas_limit {
+                // we can't fit this transaction into the block, so we need to mark it as invalid
+                // which also removes all dependent transaction from the iterator before we can
+                // continue
+                best_txs.mark_invalid(&pool_tx);
+                continue
             }
 
             // check if the job was cancelled, if so we can exit early
@@ -485,7 +490,7 @@ fn build_payload<Pool, Client>(
             }
 
             // convert tx to a signed transaction
-            let tx = tx.to_recovered_transaction();
+            let tx = pool_tx.to_recovered_transaction();
 
             // Configure the environment for the block.
             let env = Env {
@@ -497,9 +502,36 @@ fn build_payload<Pool, Client>(
             let mut evm = revm::EVM::with_env(env);
             evm.database(&mut db);
 
-            // TODO skip invalid transactions
-            let ResultAndState { result, state } =
-                evm.transact().map_err(PayloadBuilderError::EvmExecutionError)?;
+            let ResultAndState { result, state } = match evm.transact() {
+                Ok(res) => res,
+                Err(err) => {
+                    match err {
+                        EVMError::Transaction(err) => {
+                            if matches!(err, InvalidTransaction::NonceTooLow { .. }) {
+                                // if the nonce is too low, we can skip this transaction
+                                trace!(?err, ?tx, "skipping nonce too low transaction");
+                            } else {
+                                // if the transaction is invalid, we can skip it and all of its
+                                // descendants
+                                trace!(
+                                    ?err,
+                                    ?tx,
+                                    "skipping invalid transaction and its descendants"
+                                );
+                                best_txs.mark_invalid(&pool_tx);
+                            }
+                            continue
+                        }
+                        err => {
+                            // this is an error that we should treat as fatal for this attempt
+                            return Err(PayloadBuilderError::EvmExecutionError(err))
+                        }
+                    }
+                }
+            };
+
+            // let ResultAndState { result, state } =
+            evm.transact().map_err(PayloadBuilderError::EvmExecutionError)?;
             let gas_used = result.gas_used();
 
             // commit changes
@@ -532,46 +564,29 @@ fn build_payload<Pool, Client>(
             return Ok(BuildOutcome::Aborted { fees: total_fees })
         }
 
-        let mut withdrawals_root = None;
-        let mut withdrawals = None;
-
-        // get balance changes from withdrawals
-        if initialized_cfg.spec_id >= SpecId::SHANGHAI {
-            let balance_increments = post_block_withdrawals_balance_increments(
-                &chain_spec,
-                attributes.timestamp,
-                &attributes.withdrawals,
-            );
-            for (address, increment) in balance_increments {
-                increment_account_balance(
-                    &mut db,
-                    &mut post_state,
-                    block_number,
-                    address,
-                    increment,
-                )?;
-            }
-
-            // calculate withdrawals root
-            withdrawals_root =
-                Some(proofs::calculate_withdrawals_root(attributes.withdrawals.iter()));
-
-            // set withdrawals
-            withdrawals = Some(attributes.withdrawals);
-        }
-
-        // create the block header
-        let transactions_root = proofs::calculate_transaction_root(executed_txs.iter());
+        let WithdrawalsOutcome { withdrawals_root, withdrawals } = commit_withdrawals(
+            &mut db,
+            &mut post_state,
+            &chain_spec,
+            block_number,
+            attributes.timestamp,
+            attributes.withdrawals,
+        )?;
 
         let receipts_root = post_state.receipts_root();
         let logs_bloom = post_state.logs_bloom();
+
+        // calculate the state root
+        let state_root = db.db.0.state_root(post_state)?;
+
+        // create the block header
+        let transactions_root = proofs::calculate_transaction_root(executed_txs.iter());
 
         let header = Header {
             parent_hash: parent_block.hash,
             ommers_hash: EMPTY_OMMER_ROOT,
             beneficiary: initialized_block_env.coinbase,
-            // TODO compute state root
-            state_root: Default::default(),
+            state_root,
             transactions_root,
             receipts_root,
             withdrawals_root,
@@ -604,36 +619,42 @@ fn build_empty_payload<Client>(
 where
     Client: StateProviderFactory,
 {
-    // TODO this needs to access the _pending_ state of the parent block hash
-    let _state = client.latest()?;
-
     let PayloadConfig {
         initialized_block_env,
         parent_block,
         extra_data,
         attributes,
-        initialized_cfg,
+        chain_spec,
         ..
     } = config;
 
+    debug!(parent_hash=?parent_block.hash, parent_number=parent_block.number,  "building empty payload");
+
+    let state = client.state_by_block_hash(parent_block.hash)?;
+    let mut db = SubState::new(State::new(state));
+    let mut post_state = PostState::default();
+
     let base_fee = initialized_block_env.basefee.to::<u64>();
+    let block_number = initialized_block_env.number.to::<u64>();
     let block_gas_limit: u64 = initialized_block_env.gas_limit.try_into().unwrap_or(u64::MAX);
 
-    let mut withdrawals_root = None;
-    let mut withdrawals = None;
+    let WithdrawalsOutcome { withdrawals_root, withdrawals } = commit_withdrawals(
+        &mut db,
+        &mut post_state,
+        &chain_spec,
+        block_number,
+        attributes.timestamp,
+        attributes.withdrawals,
+    )?;
 
-    if initialized_cfg.spec_id >= SpecId::SHANGHAI {
-        withdrawals_root = Some(EMPTY_WITHDRAWALS);
-        // set withdrawals
-        withdrawals = Some(attributes.withdrawals);
-    }
+    // calculate the state root
+    let state_root = db.db.0.state_root(post_state)?;
 
     let header = Header {
         parent_hash: parent_block.hash,
         ommers_hash: EMPTY_OMMER_ROOT,
         beneficiary: initialized_block_env.coinbase,
-        // TODO compute state root
-        state_root: Default::default(),
+        state_root,
         transactions_root: EMPTY_TRANSACTIONS,
         withdrawals_root,
         receipts_root: EMPTY_RECEIPTS,
@@ -653,6 +674,65 @@ where
     let sealed_block = block.seal_slow();
 
     Ok(BuiltPayload::new(attributes.id, sealed_block, U256::ZERO))
+}
+
+/// Represents the outcome of committing withdrawals to the runtime database and post state.
+/// Pre-shanghai these are `None` values.
+struct WithdrawalsOutcome {
+    withdrawals: Option<Vec<Withdrawal>>,
+    withdrawals_root: Option<H256>,
+}
+
+impl WithdrawalsOutcome {
+    /// No withdrawals pre shanghai
+    fn pre_shanghai() -> Self {
+        Self { withdrawals: None, withdrawals_root: None }
+    }
+
+    fn empty() -> Self {
+        Self { withdrawals: Some(vec![]), withdrawals_root: Some(EMPTY_WITHDRAWALS) }
+    }
+}
+
+/// Executes the withdrawals and commits them to the _runtime_ Database and PostState.
+///
+/// Returns the withdrawals root.
+///
+/// Returns `None` values pre shanghai
+#[allow(clippy::too_many_arguments)]
+fn commit_withdrawals<DB>(
+    db: &mut CacheDB<DB>,
+    post_state: &mut PostState,
+    chain_spec: &ChainSpec,
+    block_number: u64,
+    timestamp: u64,
+    withdrawals: Vec<Withdrawal>,
+) -> Result<WithdrawalsOutcome, <DB as DatabaseRef>::Error>
+where
+    DB: DatabaseRef,
+{
+    if !chain_spec.is_shanghai_activated_at_timestamp(timestamp) {
+        return Ok(WithdrawalsOutcome::pre_shanghai())
+    }
+
+    if withdrawals.is_empty() {
+        return Ok(WithdrawalsOutcome::empty())
+    }
+
+    let balance_increments =
+        post_block_withdrawals_balance_increments(chain_spec, timestamp, &withdrawals);
+
+    for (address, increment) in balance_increments {
+        increment_account_balance(db, post_state, block_number, address, increment)?;
+    }
+
+    let withdrawals_root = proofs::calculate_withdrawals_root(withdrawals.iter());
+
+    // calculate withdrawals root
+    Ok(WithdrawalsOutcome {
+        withdrawals: Some(withdrawals),
+        withdrawals_root: Some(withdrawals_root),
+    })
 }
 
 /// Checks if the new payload is better than the current best.

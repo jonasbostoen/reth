@@ -4692,6 +4692,7 @@ dependencies = [
  "reth-primitives",
  "reth-provider",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -5083,10 +5084,8 @@ dependencies = [
 name = "reth-payload-builder"
 version = "0.1.0"
 dependencies = [
- "futures-core",
  "futures-util",
  "metrics",
- "reth-consensus-common",
  "reth-interfaces",
  "reth-metrics-derive",
  "reth-primitives",
@@ -5157,6 +5156,7 @@ dependencies = [
  "reth-trie",
  "thiserror",
  "tokio",
+ "tokio-stream",
  "tracing",
 ]
 
@@ -5364,6 +5364,7 @@ dependencies = [
  "reth-primitives",
  "reth-provider",
  "reth-staged-sync",
+ "reth-stages",
  "reth-tracing",
  "secp256k1 0.26.0",
  "serde",
@@ -5447,11 +5448,11 @@ dependencies = [
  "parking_lot 0.12.1",
  "paste",
  "rand 0.8.5",
+ "reth-interfaces",
  "reth-metrics-derive",
  "reth-primitives",
  "reth-provider",
  "reth-rlp",
- "ruint",
  "serde",
  "thiserror",
  "tokio",
@@ -5462,6 +5463,7 @@ dependencies = [
 name = "reth-trie"
 version = "0.1.0"
 dependencies = [
+ "criterion",
  "derive_more",
  "hex",
  "proptest",
