@@ -123,6 +123,12 @@ pub struct SealedBlock {
 }
 
 impl SealedBlock {
+    /// Create a new sealed block instance using the sealed header and block body.
+    pub fn new(header: SealedHeader, body: BlockBody) -> Self {
+        let BlockBody { transactions, ommers, withdrawals } = body;
+        Self { header, body: transactions, ommers, withdrawals }
+    }
+
     /// Header hash.
     pub fn hash(&self) -> H256 {
         self.header.hash()
@@ -152,6 +158,12 @@ impl SealedBlock {
             ommers: self.ommers,
             withdrawals: self.withdrawals,
         }
+    }
+}
+
+impl From<SealedBlock> for Block {
+    fn from(block: SealedBlock) -> Self {
+        block.unseal()
     }
 }
 
@@ -656,7 +668,7 @@ impl AsRef<H256> for RpcBlockHash {
 }
 
 /// Block number and hash.
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Hash, Default, PartialEq, Eq)]
 pub struct BlockNumHash {
     /// Block number
     pub number: BlockNumber,

@@ -28,7 +28,7 @@ use std::{
     task::{Context, Poll},
 };
 use tokio::sync::oneshot;
-use tracing::{debug, error, info};
+use tracing::debug;
 
 /// Cache limit of blocks to keep track of for a single peer.
 const PEER_BLOCK_CACHE_LIMIT: usize = 512;
@@ -275,7 +275,6 @@ where
     fn on_discovery_event(&mut self, event: DiscoveryEvent) {
         match event {
             DiscoveryEvent::Discovered { peer_id, socket_addr, fork_id } => {
-                info!(target: "patch", ?peer_id, ?socket_addr, ?fork_id, "Discovered new node");
                 self.queued_messages.push_back(StateAction::DiscoveredNode {
                     peer_id,
                     socket_addr,
@@ -406,7 +405,7 @@ where
                         Poll::Ready(res) => {
                             // check if the error is due to a closed channel to the session
                             if res.err().map(|err| err.is_channel_closed()).unwrap_or_default() {
-                                error!(
+                                debug!(
                                     target : "net",
                                     ?id,
                                     "Request canceled, response channel from session closed."

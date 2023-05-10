@@ -182,7 +182,7 @@ pub fn validate_block_standalone(
 ) -> Result<(), ConsensusError> {
     // Check ommers hash
     // TODO(onbjerg): This should probably be accessible directly on [Block]
-    let ommers_hash = reth_primitives::proofs::calculate_ommers_root(block.ommers.iter());
+    let ommers_hash = reth_primitives::proofs::calculate_ommers_root(&block.ommers);
     if block.header.ommers_hash != ommers_hash {
         return Err(ConsensusError::BodyOmmersHashDiff {
             got: ommers_hash,
@@ -192,7 +192,7 @@ pub fn validate_block_standalone(
 
     // Check transaction root
     // TODO(onbjerg): This should probably be accessible directly on [Block]
-    let transaction_root = reth_primitives::proofs::calculate_transaction_root(block.body.iter());
+    let transaction_root = reth_primitives::proofs::calculate_transaction_root(&block.body);
     if block.header.transactions_root != transaction_root {
         return Err(ConsensusError::BodyTransactionRootDiff {
             got: transaction_root,
@@ -204,8 +204,7 @@ pub fn validate_block_standalone(
     if chain_spec.fork(Hardfork::Shanghai).active_at_timestamp(block.timestamp) {
         let withdrawals =
             block.withdrawals.as_ref().ok_or(ConsensusError::BodyWithdrawalsMissing)?;
-        let withdrawals_root =
-            reth_primitives::proofs::calculate_withdrawals_root(withdrawals.iter());
+        let withdrawals_root = reth_primitives::proofs::calculate_withdrawals_root(withdrawals);
         let header_withdrawals_root =
             block.withdrawals_root.as_ref().ok_or(ConsensusError::WithdrawalsRootMissing)?;
         if withdrawals_root != *header_withdrawals_root {
@@ -249,7 +248,7 @@ pub fn validate_header_regarding_parent(
     }
 
     // timestamp in past check
-    if child.timestamp < parent.timestamp {
+    if child.timestamp <= parent.timestamp {
         return Err(ConsensusError::TimestampIsInPast {
             parent_timestamp: parent.timestamp,
             timestamp: child.timestamp,
@@ -533,6 +532,7 @@ mod tests {
         parent.gas_limit = 30000000;
         parent.base_fee_per_gas = Some(0x28041f7f5);
         parent.number -= 1;
+        parent.timestamp -= 1;
 
         let ommers = Vec::new();
         let body = Vec::new();
@@ -625,7 +625,7 @@ mod tests {
                 .collect::<Vec<_>>();
             SealedBlock {
                 header: Header {
-                    withdrawals_root: Some(proofs::calculate_withdrawals_root(withdrawals.iter())),
+                    withdrawals_root: Some(proofs::calculate_withdrawals_root(&withdrawals)),
                     ..Default::default()
                 }
                 .seal_slow(),
