@@ -94,7 +94,7 @@ pub fn validate_transaction_regarding_header(
             // EIP-1559: add more constraints to the tx validation
             // https://github.com/ethereum/EIPs/pull/3594
             if max_priority_fee_per_gas > max_fee_per_gas {
-                return Err(InvalidTransactionError::PriorityFeeMoreThenMaxFee.into())
+                return Err(InvalidTransactionError::TipAboveFeeCap.into())
             }
 
             Some(*chain_id)
@@ -109,7 +109,7 @@ pub fn validate_transaction_regarding_header(
     // https://github.com/ethereum/EIPs/pull/3594
     if let Some(base_fee_per_gas) = base_fee {
         if transaction.max_fee_per_gas() < base_fee_per_gas as u128 {
-            return Err(InvalidTransactionError::MaxFeeLessThenBaseFee.into())
+            return Err(InvalidTransactionError::FeeCapTooLow.into())
         }
     }
 
@@ -389,8 +389,9 @@ mod tests {
     use mockall::mock;
     use reth_interfaces::{Error::Consensus, Result};
     use reth_primitives::{
-        hex_literal::hex, proofs, Account, Address, BlockHash, BlockId, Bytes, ChainSpecBuilder,
-        Header, Signature, TransactionKind, TransactionSigned, Withdrawal, MAINNET, U256,
+        hex_literal::hex, proofs, Account, Address, BlockHash, BlockHashOrNumber, Bytes,
+        ChainSpecBuilder, Header, Signature, TransactionKind, TransactionSigned, Withdrawal,
+        MAINNET, U256,
     };
     use std::ops::RangeBounds;
 
@@ -402,7 +403,7 @@ mod tests {
 
             fn withdrawals_by_block(
                 &self,
-                _id: BlockId,
+                _id: BlockHashOrNumber,
                 _timestamp: u64,
             ) -> RethResult<Option<Vec<Withdrawal>>> ;
         }
@@ -475,7 +476,7 @@ mod tests {
 
         fn withdrawals_by_block(
             &self,
-            _id: BlockId,
+            _id: BlockHashOrNumber,
             _timestamp: u64,
         ) -> RethResult<Option<Vec<Withdrawal>>> {
             self.withdrawals_provider.withdrawals_by_block(_id, _timestamp)

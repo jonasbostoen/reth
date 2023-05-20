@@ -1,5 +1,6 @@
 use crate::{ExecInput, ExecOutput, Stage, StageError, StageId, UnwindInput, UnwindOutput};
 use reth_db::{database::Database, models::BlockNumberAddress};
+use reth_primitives::StageCheckpoint;
 use reth_provider::Transaction;
 use std::fmt::Debug;
 use tracing::*;
@@ -36,7 +37,7 @@ impl<DB: Database> Stage<DB> for IndexStorageHistoryStage {
         tx: &mut Transaction<'_, DB>,
         input: ExecInput,
     ) -> Result<ExecOutput, StageError> {
-        let target = input.previous_stage_progress();
+        let target = input.previous_stage_checkpoint();
         let (range, is_final_range) = input.next_block_range_with_threshold(self.commit_threshold);
 
         if range.is_empty() {
@@ -46,8 +47,8 @@ impl<DB: Database> Stage<DB> for IndexStorageHistoryStage {
         let indices = tx.get_storage_transition_ids_from_changeset(range.clone())?;
         tx.insert_storage_history_index(indices)?;
 
-        info!(target: "sync::stages::index_storage_history", "Stage finished");
-        Ok(ExecOutput { stage_progress: *range.end(), done: is_final_range })
+        info!(target: "sync::stages::index_storage_history", stage_progress = *range.end(), done = is_final_range, "Stage iteration finished");
+        Ok(ExecOutput { checkpoint: StageCheckpoint::new(*range.end()), done: is_final_range })
     }
 
     /// Unwind the stage.
@@ -56,12 +57,13 @@ impl<DB: Database> Stage<DB> for IndexStorageHistoryStage {
         tx: &mut Transaction<'_, DB>,
         input: UnwindInput,
     ) -> Result<UnwindOutput, StageError> {
-        info!(target: "sync::stages::index_account_history", to_block = input.unwind_to, "Unwinding");
-        let range = input.unwind_block_range();
+        let (range, unwind_progress, is_final_range) =
+            input.unwind_block_range_with_threshold(self.commit_threshold);
 
         tx.unwind_storage_history_indices(BlockNumberAddress::range(range))?;
 
-        Ok(UnwindOutput { stage_progress: input.unwind_to })
+        info!(target: "sync::stages::index_storage_history", to_block = input.unwind_to, unwind_progress, is_final_range, "Unwind iteration finished");
+        Ok(UnwindOutput { checkpoint: StageCheckpoint::new(unwind_progress) })
     }
 }
 
@@ -145,21 +147,27 @@ mod tests {
     }
 
     async fn run(tx: &TestTransaction, run_to: u64) {
-        let input =
-            ExecInput { previous_stage: Some((PREV_STAGE_ID, run_to)), ..Default::default() };
+        let input = ExecInput {
+            previous_stage: Some((PREV_STAGE_ID, StageCheckpoint::new(run_to))),
+            ..Default::default()
+        };
         let mut stage = IndexStorageHistoryStage::default();
         let mut tx = tx.inner();
         let out = stage.execute(&mut tx, input).await.unwrap();
-        assert_eq!(out, ExecOutput { stage_progress: 5, done: true });
+        assert_eq!(out, ExecOutput { checkpoint: StageCheckpoint::new(5), done: true });
         tx.commit().unwrap();
     }
 
     async fn unwind(tx: &TestTransaction, unwind_from: u64, unwind_to: u64) {
-        let input = UnwindInput { stage_progress: unwind_from, unwind_to, ..Default::default() };
+        let input = UnwindInput {
+            checkpoint: StageCheckpoint::new(unwind_from),
+            unwind_to,
+            ..Default::default()
+        };
         let mut stage = IndexStorageHistoryStage::default();
         let mut tx = tx.inner();
         let out = stage.unwind(&mut tx, input).await.unwrap();
-        assert_eq!(out, UnwindOutput { stage_progress: unwind_to });
+        assert_eq!(out, UnwindOutput { checkpoint: StageCheckpoint::new(unwind_to) });
         tx.commit().unwrap();
     }
 
@@ -218,7 +226,10 @@ mod tests {
     async fn insert_index_to_full_shard() {
         // init
         let tx = TestTransaction::default();
-        let _input = ExecInput { previous_stage: Some((PREV_STAGE_ID, 5)), ..Default::default() };
+        let _input = ExecInput {
+            previous_stage: Some((PREV_STAGE_ID, StageCheckpoint::new(5))),
+            ..Default::default()
+        };
 
         // change does not matter only that account is present in changeset.
         let full_list = vec![3; NUM_OF_INDICES_IN_SHARD];

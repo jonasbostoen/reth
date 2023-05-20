@@ -1,32 +1,43 @@
-use crate::{executor::Error as ExecutionError, Error};
-use reth_primitives::{BlockHash, BlockNumHash, BlockNumber, SealedBlock, SealedBlockWithSenders};
+use crate::{blockchain_tree::error::InsertBlockError, Error};
+use reth_primitives::{
+    BlockHash, BlockNumHash, BlockNumber, SealedBlock, SealedBlockWithSenders, SealedHeader,
+};
 use std::collections::{BTreeMap, HashSet};
+
+pub mod error;
 
 /// * [BlockchainTreeEngine::insert_block]: Connect block to chain, execute it and if valid insert
 ///   block inside tree.
 /// * [BlockchainTreeEngine::finalize_block]: Remove chains that join to now finalized block, as
 ///   chain becomes invalid.
 /// * [BlockchainTreeEngine::make_canonical]: Check if we have the hash of block that we want to
-///   finalize and commit it to db. If we dont have the block, pipeline syncing should start to
-///   fetch the blocks from p2p. Do reorg in tables if canonical chain if needed.
+///   finalize and commit it to db. If we don't have the block, syncing should start to fetch the
+///   blocks from p2p. Do reorg in tables if canonical chain if needed.
 pub trait BlockchainTreeEngine: BlockchainTreeViewer + Send + Sync {
     /// Recover senders and call [`BlockchainTreeEngine::insert_block`].
-    fn insert_block_without_senders(&self, block: SealedBlock) -> Result<BlockStatus, Error> {
-        let block = block.seal_with_senders().ok_or(ExecutionError::SenderRecoveryError)?;
-        self.insert_block(block)
+    fn insert_block_without_senders(
+        &self,
+        block: SealedBlock,
+    ) -> Result<BlockStatus, InsertBlockError> {
+        match block.try_seal_with_senders() {
+            Ok(block) => self.insert_block(block),
+            Err(block) => Err(InsertBlockError::sender_recovery_error(block)),
+        }
     }
 
     /// Recover senders and call [`BlockchainTreeEngine::buffer_block`].
-    fn buffer_block_without_sender(&self, block: SealedBlock) -> Result<(), Error> {
-        let block = block.seal_with_senders().ok_or(ExecutionError::SenderRecoveryError)?;
-        self.buffer_block(block)
+    fn buffer_block_without_sender(&self, block: SealedBlock) -> Result<(), InsertBlockError> {
+        match block.try_seal_with_senders() {
+            Ok(block) => self.buffer_block(block),
+            Err(block) => Err(InsertBlockError::sender_recovery_error(block)),
+        }
     }
 
-    /// buffer block with senders
-    fn buffer_block(&self, block: SealedBlockWithSenders) -> Result<(), Error>;
+    /// Buffer block with senders
+    fn buffer_block(&self, block: SealedBlockWithSenders) -> Result<(), InsertBlockError>;
 
     /// Insert block with senders
-    fn insert_block(&self, block: SealedBlockWithSenders) -> Result<BlockStatus, Error>;
+    fn insert_block(&self, block: SealedBlockWithSenders) -> Result<BlockStatus, InsertBlockError>;
 
     /// Finalize blocks up until and including `finalized_block`, and remove them from the tree.
     fn finalize_block(&self, finalized_block: BlockNumber);
@@ -90,19 +101,32 @@ pub trait BlockchainTreeViewer: Send + Sync {
     /// Caution: This will not return blocks from the canonical chain.
     fn blocks(&self) -> BTreeMap<BlockNumber, HashSet<BlockHash>>;
 
+    /// Returns the header with matching hash from the tree, if it exists.
+    ///
+    /// Caution: This will not return headers from the canonical chain.
+    fn header_by_hash(&self, hash: BlockHash) -> Option<SealedHeader>;
+
     /// Returns the block with matching hash from the tree, if it exists.
     ///
     /// Caution: This will not return blocks from the canonical chain.
     fn block_by_hash(&self, hash: BlockHash) -> Option<SealedBlock>;
 
+    /// Returns true if the tree contains the block with matching hash.
+    fn contains(&self, hash: BlockHash) -> bool {
+        self.block_by_hash(hash).is_some()
+    }
+
     /// Canonical block number and hashes best known by the tree.
     fn canonical_blocks(&self) -> BTreeMap<BlockNumber, BlockHash>;
 
-    /// Given a hash, this tries to find the last ancestor that is part of the canonical chain.
+    /// Given the parent hash of a block, this tries to find the last ancestor that is part of the
+    /// canonical chain.
     ///
     /// In other words, this will walk up the (side) chain starting with the given hash and return
     /// the first block that's canonical.
-    fn find_canonical_ancestor(&self, hash: BlockHash) -> Option<BlockHash>;
+    ///
+    /// Note: this could be the given `parent_hash` if it's already canonical.
+    fn find_canonical_ancestor(&self, parent_hash: BlockHash) -> Option<BlockHash>;
 
     /// Return BlockchainTree best known canonical chain tip (BlockHash, BlockNumber)
     fn canonical_tip(&self) -> BlockNumHash;
@@ -120,5 +144,10 @@ pub trait BlockchainTreeViewer: Send + Sync {
     /// Returns the pending block if there is one.
     fn pending_block(&self) -> Option<SealedBlock> {
         self.block_by_hash(self.pending_block_num_hash()?.hash)
+    }
+
+    /// Returns the pending block if there is one.
+    fn pending_header(&self) -> Option<SealedHeader> {
+        self.header_by_hash(self.pending_block_num_hash()?.hash)
     }
 }

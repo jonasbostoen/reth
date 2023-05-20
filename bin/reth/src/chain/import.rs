@@ -1,8 +1,9 @@
 use crate::{
     dirs::{DataDirPath, MaybePlatformPath},
     node::events::{handle_events, NodeEvent},
+    version::SHORT_VERSION,
 };
-use clap::{crate_version, Parser};
+use clap::Parser;
 use eyre::Context;
 use futures::{Stream, StreamExt};
 use reth_beacon_consensus::BeaconConsensus;
@@ -12,7 +13,7 @@ use reth_downloaders::{
     bodies::bodies::BodiesDownloaderBuilder,
     headers::reverse_headers::ReverseHeadersDownloaderBuilder, test_utils::FileClient,
 };
-use reth_interfaces::{consensus::Consensus, p2p::headers::client::NoopStatusUpdater};
+use reth_interfaces::consensus::Consensus;
 use reth_primitives::{ChainSpec, H256};
 use reth_staged_sync::{
     utils::{
@@ -77,7 +78,7 @@ pub struct ImportCommand {
 impl ImportCommand {
     /// Execute `import` command
     pub async fn execute(self) -> eyre::Result<()> {
-        info!(target: "reth::cli", "reth {} starting", crate_version!());
+        info!(target: "reth::cli", "reth {} starting", SHORT_VERSION);
 
         // add network name to data dir
         let data_dir = self.datadir.unwrap_or_chain_default(self.chain.chain);
@@ -157,14 +158,12 @@ impl ImportCommand {
             .with_tip_sender(tip_tx)
             // we want to sync all blocks the file client provides or 0 if empty
             .with_max_block(file_client.max_block().unwrap_or(0))
-            .with_sync_state_updater(file_client)
             .add_stages(
                 DefaultStages::new(
                     HeaderSyncMode::Tip(tip_rx),
                     consensus.clone(),
                     header_downloader,
                     body_downloader,
-                    NoopStatusUpdater::default(),
                     factory.clone(),
                 )
                 .set(

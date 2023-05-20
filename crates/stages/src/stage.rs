@@ -1,28 +1,31 @@
 use crate::{error::StageError, id::StageId};
 use async_trait::async_trait;
 use reth_db::database::Database;
-use reth_primitives::BlockNumber;
+use reth_primitives::{BlockNumber, StageCheckpoint};
 use reth_provider::Transaction;
-use std::{cmp::min, ops::RangeInclusive};
+use std::{
+    cmp::{max, min},
+    ops::RangeInclusive,
+};
 
 /// Stage execution input, see [Stage::execute].
 #[derive(Debug, Default, PartialEq, Eq, Clone, Copy)]
 pub struct ExecInput {
-    /// The stage that was run before the current stage and the block number it reached.
-    pub previous_stage: Option<(StageId, BlockNumber)>,
+    /// The stage that was run before the current stage and the progress it reached.
+    pub previous_stage: Option<(StageId, StageCheckpoint)>,
     /// The progress of this stage the last time it was executed.
-    pub stage_progress: Option<BlockNumber>,
+    pub checkpoint: Option<StageCheckpoint>,
 }
 
 impl ExecInput {
     /// Return the progress of the stage or default.
-    pub fn stage_progress(&self) -> BlockNumber {
-        self.stage_progress.unwrap_or_default()
+    pub fn checkpoint(&self) -> StageCheckpoint {
+        self.checkpoint.unwrap_or_default()
     }
 
     /// Return the progress of the previous stage or default.
-    pub fn previous_stage_progress(&self) -> BlockNumber {
-        self.previous_stage.as_ref().map(|(_, num)| *num).unwrap_or_default()
+    pub fn previous_stage_checkpoint(&self) -> StageCheckpoint {
+        self.previous_stage.map(|(_, checkpoint)| checkpoint).unwrap_or_default()
     }
 
     /// Return next block range that needs to be executed.
@@ -33,7 +36,7 @@ impl ExecInput {
 
     /// Return true if this is the first block range to execute.
     pub fn is_first_range(&self) -> bool {
-        self.stage_progress.is_none()
+        self.checkpoint.is_none()
     }
 
     /// Return the next block range to execute.
@@ -42,12 +45,12 @@ impl ExecInput {
         &self,
         threshold: u64,
     ) -> (RangeInclusive<BlockNumber>, bool) {
-        // plus +1 is to skip present block and allways start from block number 1, not 0.
-        let current_block = self.stage_progress.unwrap_or_default();
-        let start = current_block + 1;
-        let target = self.previous_stage_progress();
+        let current_block = self.checkpoint.unwrap_or_default();
+        // +1 is to skip present block and always start from block number 1, not 0.
+        let start = current_block.block_number + 1;
+        let target = self.previous_stage_checkpoint().block_number;
 
-        let end = min(target, current_block.saturating_add(threshold));
+        let end = min(target, current_block.block_number.saturating_add(threshold));
 
         let is_final_range = end == target;
         (start..=end, is_final_range)
@@ -57,8 +60,8 @@ impl ExecInput {
 /// Stage unwind input, see [Stage::unwind].
 #[derive(Debug, Default, PartialEq, Eq, Clone, Copy)]
 pub struct UnwindInput {
-    /// The current highest block of the stage.
-    pub stage_progress: BlockNumber,
+    /// The current highest progress of the stage.
+    pub checkpoint: StageCheckpoint,
     /// The block to unwind to.
     pub unwind_to: BlockNumber,
     /// The bad block that caused the unwind, if any.
@@ -66,20 +69,26 @@ pub struct UnwindInput {
 }
 
 impl UnwindInput {
-    /// Return next block range that needs to be executed.
+    /// Return next block range that needs to be unwound.
     pub fn unwind_block_range(&self) -> RangeInclusive<BlockNumber> {
-        self.unwind_block_range_with_threshold(u64::MAX)
+        self.unwind_block_range_with_threshold(u64::MAX).0
     }
 
-    /// Return the next block range to execute.
-    pub fn unwind_block_range_with_threshold(&self, threshold: u64) -> RangeInclusive<BlockNumber> {
-        // plus +1 is to skip present block.
-        let start = self.unwind_to + 1;
-        let mut end = self.stage_progress;
+    /// Return the next block range to unwind and the block we're unwinding to.
+    pub fn unwind_block_range_with_threshold(
+        &self,
+        threshold: u64,
+    ) -> (RangeInclusive<BlockNumber>, BlockNumber, bool) {
+        // +1 is to skip the block we're unwinding to
+        let mut start = self.unwind_to + 1;
+        let end = self.checkpoint;
 
-        end = min(end, start.saturating_add(threshold));
+        start = max(start, end.block_number.saturating_sub(threshold));
 
-        start..=end
+        let unwind_to = start - 1;
+
+        let is_final_range = unwind_to == self.unwind_to;
+        (start..=end.block_number, unwind_to, is_final_range)
     }
 }
 
@@ -87,15 +96,15 @@ impl UnwindInput {
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct ExecOutput {
     /// How far the stage got.
-    pub stage_progress: BlockNumber,
+    pub checkpoint: StageCheckpoint,
     /// Whether or not the stage is done.
     pub done: bool,
 }
 
 impl ExecOutput {
-    /// Mark the stage as done, checkpointing at the given block number.
-    pub fn done(stage_progress: BlockNumber) -> Self {
-        Self { stage_progress, done: true }
+    /// Mark the stage as done, checkpointing at the given place.
+    pub fn done(checkpoint: StageCheckpoint) -> Self {
+        Self { checkpoint, done: true }
     }
 }
 
@@ -103,7 +112,7 @@ impl ExecOutput {
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct UnwindOutput {
     /// The block at which the stage has unwound to.
-    pub stage_progress: BlockNumber,
+    pub checkpoint: StageCheckpoint,
 }
 
 /// A stage is a segmented part of the syncing process of the node.

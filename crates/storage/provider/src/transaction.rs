@@ -17,11 +17,11 @@ use reth_db::{
     transaction::{DbTx, DbTxMut, DbTxMutGAT},
     BlockNumberList,
 };
-use reth_interfaces::{db::Error as DbError, provider::ProviderError};
+use reth_interfaces::{db::DatabaseError as DbError, provider::ProviderError};
 use reth_primitives::{
     keccak256, Account, Address, BlockHash, BlockNumber, ChainSpec, Hardfork, Header, SealedBlock,
-    SealedBlockWithSenders, StorageEntry, TransactionSigned, TransactionSignedEcRecovered,
-    TxNumber, H256, U256,
+    SealedBlockWithSenders, StageCheckpoint, StorageEntry, TransactionSigned,
+    TransactionSignedEcRecovered, H256, U256,
 };
 use reth_trie::{StateRoot, StateRootError};
 use std::{
@@ -76,6 +76,8 @@ impl<'a, DB: Database> DerefMut for Transaction<'a, DB> {
     }
 }
 
+// === Core impl ===
+
 impl<'this, DB> Transaction<'this, DB>
 where
     DB: Database,
@@ -95,23 +97,6 @@ where
     /// Accessor to the internal Database
     pub fn inner(&self) -> &'this DB {
         self.db
-    }
-
-    /// Get lastest block number.
-    pub fn tip_number(&self) -> Result<u64, DbError> {
-        Ok(self.cursor_read::<tables::CanonicalHeaders>()?.last()?.unwrap_or_default().0)
-    }
-
-    /// Commit the current inner transaction and open a new one.
-    ///
-    /// # Panics
-    ///
-    /// Panics if an inner transaction does not exist. This should never be the case unless
-    /// [Transaction::close] was called without following up with a call to [Transaction::open].
-    pub fn commit(&mut self) -> Result<bool, DbError> {
-        let success = if let Some(tx) = self.tx.take() { tx.commit()? } else { false };
-        self.tx = Some(self.db.tx_mut()?);
-        Ok(success)
     }
 
     /// Drops the current inner transaction and open a new one.
@@ -136,11 +121,35 @@ where
         self.tx.take();
     }
 
+    /// Commit the current inner transaction and open a new one.
+    ///
+    /// # Panics
+    ///
+    /// Panics if an inner transaction does not exist. This should never be the case unless
+    /// [Transaction::close] was called without following up with a call to [Transaction::open].
+    pub fn commit(&mut self) -> Result<bool, DbError> {
+        let success = if let Some(tx) = self.tx.take() { tx.commit()? } else { false };
+        self.tx = Some(self.db.tx_mut()?);
+        Ok(success)
+    }
+}
+
+// === Misc helpers ===
+
+impl<'this, DB> Transaction<'this, DB>
+where
+    DB: Database,
+{
+    /// Get lastest block number.
+    pub fn tip_number(&self) -> Result<u64, DbError> {
+        Ok(self.cursor_read::<tables::CanonicalHeaders>()?.last()?.unwrap_or_default().0)
+    }
+
     /// Query [tables::CanonicalHeaders] table for block hash by block number
     pub fn get_block_hash(&self, block_number: BlockNumber) -> Result<BlockHash, TransactionError> {
         let hash = self
             .get::<tables::CanonicalHeaders>(block_number)?
-            .ok_or(ProviderError::CanonicalHeader { block_number })?;
+            .ok_or_else(|| ProviderError::HeaderNotFound(block_number.into()))?;
         Ok(hash)
     }
 
@@ -151,26 +160,15 @@ where
     ) -> Result<StoredBlockBodyIndices, TransactionError> {
         let body = self
             .get::<tables::BlockBodyIndices>(number)?
-            .ok_or(ProviderError::BlockBodyIndices { number })?;
+            .ok_or(ProviderError::BlockBodyIndicesNotFound(number))?;
         Ok(body)
-    }
-
-    /// Get the next start transaction id and transition for the `block` by looking at the previous
-    /// block. Returns Zero/Zero for Genesis.
-    pub fn first_block_number(&self, block: BlockNumber) -> Result<TxNumber, TransactionError> {
-        if block == 0 {
-            return Ok(0)
-        }
-
-        let prev_number = block - 1;
-        let prev_body = self.block_body_indices(prev_number)?;
-        Ok(prev_body.first_tx_num + prev_body.tx_count)
     }
 
     /// Query the block header by number
     pub fn get_header(&self, number: BlockNumber) -> Result<Header, TransactionError> {
-        let header =
-            self.get::<tables::Headers>(number)?.ok_or(ProviderError::Header { number })?;
+        let header = self
+            .get::<tables::Headers>(number)?
+            .ok_or_else(|| ProviderError::HeaderNotFound(number.into()))?;
         Ok(header)
     }
 
@@ -178,7 +176,7 @@ where
     pub fn get_td(&self, block: BlockNumber) -> Result<U256, TransactionError> {
         let td = self
             .get::<tables::HeaderTD>(block)?
-            .ok_or(ProviderError::TotalDifficulty { number: block })?;
+            .ok_or(ProviderError::TotalDifficultyNotFound { number: block })?;
         Ok(td.into())
     }
 
@@ -261,45 +259,12 @@ where
     }
 }
 
-/// Stages impl
+// === Stages impl ===
+
 impl<'this, DB> Transaction<'this, DB>
 where
     DB: Database,
 {
-    /// Get requested blocks transaction with signer
-    pub fn get_block_transaction_range(
-        &self,
-        range: impl RangeBounds<BlockNumber> + Clone,
-    ) -> Result<Vec<(BlockNumber, Vec<TransactionSignedEcRecovered>)>, TransactionError> {
-        self.get_take_block_transaction_range::<false>(range)
-    }
-
-    /// Take requested blocks transaction with signer
-    pub fn take_block_transaction_range(
-        &self,
-        range: impl RangeBounds<BlockNumber> + Clone,
-    ) -> Result<Vec<(BlockNumber, Vec<TransactionSignedEcRecovered>)>, TransactionError> {
-        self.get_take_block_transaction_range::<true>(range)
-    }
-
-    /// Return range of blocks and its execution result
-    pub fn get_block_range(
-        &self,
-        chain_spec: &ChainSpec,
-        range: impl RangeBounds<BlockNumber> + Clone,
-    ) -> Result<Vec<SealedBlockWithSenders>, TransactionError> {
-        self.get_take_block_range::<false>(chain_spec, range)
-    }
-
-    /// Return range of blocks and its execution result
-    pub fn take_block_range(
-        &self,
-        chain_spec: &ChainSpec,
-        range: impl RangeBounds<BlockNumber> + Clone,
-    ) -> Result<Vec<SealedBlockWithSenders>, TransactionError> {
-        self.get_take_block_range::<true>(chain_spec, range)
-    }
-
     /// Get range of blocks and its execution result
     pub fn get_block_and_execution_range(
         &self,
@@ -496,9 +461,6 @@ where
         let new_tip = blocks.last().unwrap();
         let new_tip_number = new_tip.number;
 
-        // Write state and changesets to the database
-        state.write_to_db(self.deref_mut())?;
-
         let first_number = blocks.first().unwrap().number;
 
         let last = blocks.last().unwrap();
@@ -510,6 +472,10 @@ where
         for block in blocks {
             self.insert_block(block)?;
         }
+
+        // Write state and changesets to the database.
+        // Must be written after blocks because of the receipt lookup.
+        state.write_to_db(self.deref_mut())?;
 
         self.insert_hashes(first_number..=last_block_number, last_block_hash, expected_state_root)?;
 
@@ -953,7 +919,10 @@ where
         for (block_number, block_body) in block_bodies.into_iter() {
             for _ in block_body.tx_num_range() {
                 if let Some((_, receipt)) = receipt_iter.next() {
-                    block_states.entry(block_number).or_default().add_receipt(receipt);
+                    block_states
+                        .entry(block_number)
+                        .or_default()
+                        .add_receipt(block_number, receipt);
                 }
             }
         }
@@ -1026,8 +995,9 @@ where
     ) -> Result<(), TransactionError> {
         // iterate over all existing stages in the table and update its progress.
         let mut cursor = self.cursor_write::<tables::SyncStage>()?;
-        while let Some((stage_name, _)) = cursor.next()? {
-            cursor.upsert(stage_name, block_number)?
+        while let Some((stage_name, checkpoint)) = cursor.next()? {
+            // TODO(alexey): do we want to invalidate stage-specific checkpoint data?
+            cursor.upsert(stage_name, StageCheckpoint { block_number, ..checkpoint })?
         }
 
         Ok(())

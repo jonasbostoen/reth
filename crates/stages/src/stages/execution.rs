@@ -9,7 +9,8 @@ use reth_db::{
 };
 use reth_metrics_derive::Metrics;
 use reth_primitives::{
-    constants::MGAS_TO_GAS, Block, BlockNumber, BlockWithSenders, TransactionSigned, U256,
+    constants::MGAS_TO_GAS, Block, BlockNumber, BlockWithSenders, StageCheckpoint,
+    TransactionSigned, U256,
 };
 use reth_provider::{
     post_state::PostState, BlockExecutor, ExecutorFactory, LatestStateProviderRef, Transaction,
@@ -134,14 +135,14 @@ impl<EF: ExecutorFactory> ExecutionStage<EF> {
         tx: &mut Transaction<'_, DB>,
         input: ExecInput,
     ) -> Result<ExecOutput, StageError> {
-        let start_block = input.stage_progress() + 1;
-        let max_block = input.previous_stage_progress();
+        let start_block = input.checkpoint().block_number + 1;
+        let max_block = input.previous_stage_checkpoint().block_number;
 
         // Build executor
         let mut executor = self.executor_factory.with_sp(LatestStateProviderRef::new(&**tx));
 
         // Progress tracking
-        let mut progress = start_block;
+        let mut stage_progress = start_block;
 
         // Execute block range
         let mut state = PostState::default();
@@ -164,10 +165,10 @@ impl<EF: ExecutorFactory> ExecutionStage<EF> {
 
             // Merge state changes
             state.extend(block_state);
-            progress = block_number;
+            stage_progress = block_number;
 
             // Write history periodically to free up memory
-            if self.thresholds.should_write_history(state.changeset_size() as u64) {
+            if self.thresholds.should_write_history(state.changeset_size_hint() as u64) {
                 info!(target: "sync::stages::execution", ?block_number, "Writing history.");
                 state.write_history_to_db(&**tx)?;
                 info!(target: "sync::stages::execution", ?block_number, "Wrote history.");
@@ -175,8 +176,8 @@ impl<EF: ExecutorFactory> ExecutionStage<EF> {
             }
 
             // Check if we should commit now
-            if self.thresholds.is_end_of_batch(block_number - start_block, state.size() as u64) {
-                info!(target: "sync::stages::execution", ?block_number, "Threshold hit, committing.");
+            if self.thresholds.is_end_of_batch(block_number - start_block, state.size_hint() as u64)
+            {
                 break
             }
         }
@@ -186,7 +187,10 @@ impl<EF: ExecutorFactory> ExecutionStage<EF> {
         trace!(target: "sync::stages::execution", accounts = state.accounts().len(), "Writing updated state to database");
         state.write_to_db(&**tx)?;
         trace!(target: "sync::stages::execution", took = ?Instant::now().duration_since(start), "Wrote state");
-        Ok(ExecOutput { stage_progress: progress, done: progress == max_block })
+
+        let is_final_range = stage_progress == max_block;
+        info!(target: "sync::stages::execution", stage_progress, is_final_range, "Stage iteration finished");
+        Ok(ExecOutput { checkpoint: StageCheckpoint::new(stage_progress), done: is_final_range })
     }
 }
 
@@ -237,22 +241,21 @@ impl<EF: ExecutorFactory, DB: Database> Stage<DB> for ExecutionStage<EF> {
         tx: &mut Transaction<'_, DB>,
         input: UnwindInput,
     ) -> Result<UnwindOutput, StageError> {
-        info!(target: "sync::stages::execution", to_block = input.unwind_to, "Unwinding");
-
         // Acquire changeset cursors
         let mut account_changeset = tx.cursor_dup_write::<tables::AccountChangeSet>()?;
         let mut storage_changeset = tx.cursor_dup_write::<tables::StorageChangeSet>()?;
 
-        let block_range = input.unwind_to + 1..=input.stage_progress;
+        let (range, unwind_to, is_final_range) =
+            input.unwind_block_range_with_threshold(self.thresholds.max_blocks.unwrap_or(u64::MAX));
 
-        if block_range.is_empty() {
-            return Ok(UnwindOutput { stage_progress: input.unwind_to })
+        if range.is_empty() {
+            return Ok(UnwindOutput { checkpoint: StageCheckpoint::new(input.unwind_to) })
         }
 
         // get all batches for account change
         // Check if walk and walk_dup would do the same thing
         let account_changeset_batch =
-            account_changeset.walk_range(block_range.clone())?.collect::<Result<Vec<_>, _>>()?;
+            account_changeset.walk_range(range.clone())?.collect::<Result<Vec<_>, _>>()?;
 
         // revert all changes to PlainState
         for (_, changeset) in account_changeset_batch.into_iter().rev() {
@@ -265,7 +268,7 @@ impl<EF: ExecutorFactory, DB: Database> Stage<DB> for ExecutionStage<EF> {
 
         // get all batches for storage change
         let storage_changeset_batch = storage_changeset
-            .walk_range(BlockNumberAddress::range(block_range.clone()))?
+            .walk_range(BlockNumberAddress::range(range.clone()))?
             .collect::<Result<Vec<_>, _>>()?;
 
         // revert all changes to PlainStorage
@@ -286,7 +289,7 @@ impl<EF: ExecutorFactory, DB: Database> Stage<DB> for ExecutionStage<EF> {
         // Discard unwinded changesets
         let mut rev_acc_changeset_walker = account_changeset.walk_back(None)?;
         while let Some((block_num, _)) = rev_acc_changeset_walker.next().transpose()? {
-            if block_num < *block_range.start() {
+            if block_num <= unwind_to {
                 break
             }
             // delete all changesets
@@ -295,14 +298,15 @@ impl<EF: ExecutorFactory, DB: Database> Stage<DB> for ExecutionStage<EF> {
 
         let mut rev_storage_changeset_walker = storage_changeset.walk_back(None)?;
         while let Some((key, _)) = rev_storage_changeset_walker.next().transpose()? {
-            if key.block_number() < *block_range.start() {
+            if key.block_number() < *range.start() {
                 break
             }
             // delete all changesets
             tx.delete::<tables::StorageChangeSet>(key, None)?;
         }
 
-        Ok(UnwindOutput { stage_progress: input.unwind_to })
+        info!(target: "sync::stages::execution", to_block = input.unwind_to, unwind_progress = unwind_to, is_final_range, "Unwind iteration finished");
+        Ok(UnwindOutput { checkpoint: StageCheckpoint::new(unwind_to) })
     }
 }
 
@@ -392,9 +396,9 @@ mod tests {
         let state_db = create_test_db::<WriteMap>(EnvKind::RW);
         let mut tx = Transaction::new(state_db.as_ref()).unwrap();
         let input = ExecInput {
-            previous_stage: Some((PREV_STAGE_ID, 1)),
+            previous_stage: Some((PREV_STAGE_ID, StageCheckpoint::new(1))),
             /// The progress of this stage the last time it was executed.
-            stage_progress: None,
+            checkpoint: None,
         };
         let mut genesis_rlp = hex!("f901faf901f5a00000000000000000000000000000000000000000000000000000000000000000a01dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347942adc25665018aa1fe0e6bc666dac8fc2697ff9baa045571b40ae66ca7480791bbb2887286e4e4c4b1b298b191c889d6959023a32eda056e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421a056e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421b901000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000083020000808502540be400808000a00000000000000000000000000000000000000000000000000000000000000000880000000000000000c0c0").as_slice();
         let genesis = SealedBlock::decode(&mut genesis_rlp).unwrap();
@@ -429,7 +433,7 @@ mod tests {
         let mut execution_stage = stage();
         let output = execution_stage.execute(&mut tx, input).await.unwrap();
         tx.commit().unwrap();
-        assert_eq!(output, ExecOutput { stage_progress: 1, done: true });
+        assert_eq!(output, ExecOutput { checkpoint: StageCheckpoint::new(1), done: true });
         let tx = tx.deref_mut();
         // check post state
         let account1 = H160(hex!("1000000000000000000000000000000000000000"));
@@ -481,9 +485,9 @@ mod tests {
         let state_db = create_test_db::<WriteMap>(EnvKind::RW);
         let mut tx = Transaction::new(state_db.as_ref()).unwrap();
         let input = ExecInput {
-            previous_stage: Some((PREV_STAGE_ID, 1)),
+            previous_stage: Some((PREV_STAGE_ID, StageCheckpoint::new(1))),
             /// The progress of this stage the last time it was executed.
-            stage_progress: None,
+            checkpoint: None,
         };
         let mut genesis_rlp = hex!("f901faf901f5a00000000000000000000000000000000000000000000000000000000000000000a01dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347942adc25665018aa1fe0e6bc666dac8fc2697ff9baa045571b40ae66ca7480791bbb2887286e4e4c4b1b298b191c889d6959023a32eda056e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421a056e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421b901000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000083020000808502540be400808000a00000000000000000000000000000000000000000000000000000000000000000880000000000000000c0c0").as_slice();
         let genesis = SealedBlock::decode(&mut genesis_rlp).unwrap();
@@ -516,11 +520,14 @@ mod tests {
 
         let mut stage = stage();
         let o = stage
-            .unwind(&mut tx, UnwindInput { stage_progress: 1, unwind_to: 0, bad_block: None })
+            .unwind(
+                &mut tx,
+                UnwindInput { checkpoint: StageCheckpoint::new(1), unwind_to: 0, bad_block: None },
+            )
             .await
             .unwrap();
 
-        assert_eq!(o, UnwindOutput { stage_progress: 0 });
+        assert_eq!(o, UnwindOutput { checkpoint: StageCheckpoint::new(0) });
 
         // assert unwind stage
         let db_tx = tx.deref();
@@ -548,9 +555,9 @@ mod tests {
         let test_tx = TestTransaction::default();
         let mut tx = test_tx.inner();
         let input = ExecInput {
-            previous_stage: Some((PREV_STAGE_ID, 1)),
+            previous_stage: Some((PREV_STAGE_ID, StageCheckpoint::new(1))),
             /// The progress of this stage the last time it was executed.
-            stage_progress: None,
+            checkpoint: None,
         };
         let mut genesis_rlp = hex!("f901f8f901f3a00000000000000000000000000000000000000000000000000000000000000000a01dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347942adc25665018aa1fe0e6bc666dac8fc2697ff9baa0c9ceb8372c88cb461724d8d3d87e8b933f6fc5f679d4841800e662f4428ffd0da056e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421a056e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421b90100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000008302000080830f4240808000a00000000000000000000000000000000000000000000000000000000000000000880000000000000000c0c0").as_slice();
         let genesis = SealedBlock::decode(&mut genesis_rlp).unwrap();
