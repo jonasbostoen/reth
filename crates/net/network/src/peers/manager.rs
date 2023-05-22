@@ -565,7 +565,7 @@ impl PeersManager {
                     peer.remove_after_disconnect = false;
                 }
 
-                return
+                return;
             }
             Entry::Vacant(entry) => {
                 trace!(target : "net::peers", ?peer_id, ?addr, "discovered new node");
@@ -629,10 +629,10 @@ impl PeersManager {
     /// Returns `None` if no peer is available.
     fn best_unconnected(&mut self) -> Option<(PeerId, &mut Peer)> {
         let mut unconnected = self.peers.iter_mut().filter(|(_, peer)| {
-            peer.state.is_unconnected() &&
-                !peer.is_banned() &&
-                !peer.is_backed_off() &&
-                (!self.connect_trusted_nodes_only || peer.is_trusted())
+            peer.state.is_unconnected()
+                && !peer.is_banned()
+                && !peer.is_backed_off()
+                && (!self.connect_trusted_nodes_only || peer.is_trusted())
         });
 
         // keep track of the best peer, if there's one
@@ -742,7 +742,7 @@ impl PeersManager {
                         if let Some(peer) = self.peers.get_mut(peer_id) {
                             peer.backed_off = false;
                         }
-                        return false
+                        return false;
                     }
                     true
                 })
@@ -788,6 +788,7 @@ pub struct ConnectionInfo {
 impl ConnectionInfo {
     ///  Returns `true` if there's still capacity for a new outgoing connection.
     fn has_out_capacity(&self) -> bool {
+        debug!(target: "patch", current = self.num_outbound, max = self.max_outbound, "has_out_capacity");
         self.num_outbound < self.max_outbound
     }
 
