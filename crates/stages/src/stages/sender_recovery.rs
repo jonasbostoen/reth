@@ -1,4 +1,4 @@
-use crate::{ExecInput, ExecOutput, Stage, StageError, StageId, UnwindInput, UnwindOutput};
+use crate::{ExecInput, ExecOutput, Stage, StageError, UnwindInput, UnwindOutput};
 use itertools::Itertools;
 use reth_db::{
     cursor::{DbCursorRO, DbCursorRW},
@@ -7,15 +7,16 @@ use reth_db::{
     transaction::{DbTx, DbTxMut},
     RawKey, RawTable, RawValue,
 };
-use reth_primitives::{keccak256, StageCheckpoint, TransactionSignedNoHash, TxNumber, H160};
+use reth_primitives::{
+    keccak256,
+    stage::{StageCheckpoint, StageId},
+    TransactionSignedNoHash, TxNumber, H160,
+};
 use reth_provider::Transaction;
 use std::fmt::Debug;
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tracing::*;
-
-/// The [`StageId`] of the sender recovery stage.
-pub const SENDER_RECOVERY: StageId = StageId("SenderRecovery");
 
 /// The sender recovery stage iterates over existing transactions,
 /// recovers the transaction signer and stores them
@@ -37,7 +38,7 @@ impl Default for SenderRecoveryStage {
 impl<DB: Database> Stage<DB> for SenderRecoveryStage {
     /// Return the id of the stage
     fn id(&self) -> StageId {
-        SENDER_RECOVERY
+        StageId::SenderRecovery
     }
 
     /// Retrieve the range of transactions to iterate over by querying
@@ -316,7 +317,7 @@ mod tests {
         type Seed = Vec<SealedBlock>;
 
         fn seed_execution(&mut self, input: ExecInput) -> Result<Self::Seed, TestRunnerError> {
-            let stage_progress = input.checkpoint.unwrap_or_default().block_number;
+            let stage_progress = input.checkpoint().block_number;
             let end = input.previous_stage_checkpoint().block_number;
 
             let blocks = random_block_range(stage_progress..=end, H256::zero(), 0..2);
@@ -331,7 +332,7 @@ mod tests {
         ) -> Result<(), TestRunnerError> {
             match output {
                 Some(output) => self.tx.query(|tx| {
-                    let start_block = input.checkpoint.unwrap_or_default().block_number + 1;
+                    let start_block = input.checkpoint().block_number + 1;
                     let end_block = output.checkpoint.block_number;
 
                     if start_block > end_block {
@@ -355,9 +356,7 @@ mod tests {
 
                     Ok(())
                 })?,
-                None => self.ensure_no_senders_by_block(
-                    input.checkpoint.unwrap_or_default().block_number,
-                )?,
+                None => self.ensure_no_senders_by_block(input.checkpoint().block_number)?,
             };
 
             Ok(())

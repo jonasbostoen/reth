@@ -1049,6 +1049,7 @@ pub enum PeerAction {
 /// Config type for initiating a [`PeersManager`] instance
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(default))]
 pub struct PeersConfig {
     /// How often to recheck free slots for outbound connections.
     #[cfg_attr(feature = "serde", serde(with = "humantime_serde"))]

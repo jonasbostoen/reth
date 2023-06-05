@@ -12,8 +12,8 @@ pub use typed::*;
 
 use reth_primitives::{
     rpc::transaction::eip2930::AccessListItem, Address, BlockNumber, Bytes,
-    Transaction as PrimitiveTransaction, TransactionKind, TransactionSignedEcRecovered, TxType,
-    H256, U128, U256, U64,
+    Transaction as PrimitiveTransaction, TransactionKind as PrimitiveTransactionKind,
+    TransactionSignedEcRecovered, TxType, H256, U128, U256, U64,
 };
 use serde::{Deserialize, Serialize};
 
@@ -105,13 +105,13 @@ impl Transaction {
         let signed_tx = tx.into_signed();
 
         let to = match signed_tx.kind() {
-            TransactionKind::Create => None,
-            TransactionKind::Call(to) => Some(*to),
+            PrimitiveTransactionKind::Create => None,
+            PrimitiveTransactionKind::Call(to) => Some(*to),
         };
 
         let (gas_price, max_fee_per_gas) = match signed_tx.tx_type() {
             TxType::Legacy => (Some(U128::from(signed_tx.max_fee_per_gas())), None),
-            TxType::EIP2930 => (None, Some(U128::from(signed_tx.max_fee_per_gas()))),
+            TxType::EIP2930 => (Some(U128::from(signed_tx.max_fee_per_gas())), None),
             TxType::EIP1559 => {
                 // the gas price field for EIP1559 is set to `min(tip, gasFeeCap - baseFee) +
                 // baseFee`

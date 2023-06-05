@@ -118,7 +118,7 @@ impl Default for Header {
 }
 
 impl Header {
-    /// Retuen paret block number and hash
+    /// Returns the parent block's number and hash
     pub fn parent_num_hash(&self) -> BlockNumHash {
         BlockNumHash { number: self.number.saturating_sub(1), hash: self.parent_hash }
     }
@@ -306,6 +306,11 @@ impl SealedHeader {
     /// Extract raw header that can be modified.
     pub fn unseal(self) -> Header {
         self.header
+    }
+
+    /// This is the inverse of [Header::seal_slow] which returns the raw header and hash.
+    pub fn split(self) -> (Header, BlockHash) {
+        (self.header, self.hash)
     }
 
     /// Return header/block hash.

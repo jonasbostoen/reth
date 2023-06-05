@@ -1,4 +1,4 @@
-use crate::{ExecInput, ExecOutput, Stage, StageError, StageId, UnwindInput, UnwindOutput};
+use crate::{ExecInput, ExecOutput, Stage, StageError, UnwindInput, UnwindOutput};
 use reth_db::{
     cursor::{DbCursorRO, DbCursorRW},
     database::Database,
@@ -6,13 +6,13 @@ use reth_db::{
     transaction::{DbTx, DbTxMut},
 };
 use reth_interfaces::{consensus::Consensus, provider::ProviderError};
-use reth_primitives::{StageCheckpoint, U256};
+use reth_primitives::{
+    stage::{StageCheckpoint, StageId},
+    U256,
+};
 use reth_provider::Transaction;
 use std::sync::Arc;
 use tracing::*;
-
-/// The [`StageId`] of the total difficulty stage.
-pub const TOTAL_DIFFICULTY: StageId = StageId("TotalDifficulty");
 
 /// The total difficulty stage.
 ///
@@ -44,7 +44,7 @@ impl TotalDifficultyStage {
 impl<DB: Database> Stage<DB> for TotalDifficultyStage {
     /// Return the id of the stage
     fn id(&self) -> StageId {
-        TOTAL_DIFFICULTY
+        StageId::TotalDifficulty
     }
 
     /// Write total difficulty entries
@@ -63,7 +63,7 @@ impl<DB: Database> Stage<DB> for TotalDifficultyStage {
         let mut cursor_headers = tx.cursor_read::<tables::Headers>()?;
 
         // Get latest total difficulty
-        let last_header_number = input.checkpoint.unwrap_or_default().block_number;
+        let last_header_number = input.checkpoint().block_number;
         let last_entry = cursor_td
             .seek_exact(last_header_number)?
             .ok_or(ProviderError::TotalDifficultyNotFound { number: last_header_number })?;
@@ -78,7 +78,7 @@ impl<DB: Database> Stage<DB> for TotalDifficultyStage {
 
             self.consensus
                 .validate_header_with_total_difficulty(&header, td)
-                .map_err(|error| StageError::Validation { block: header.number, error })?;
+                .map_err(|error| StageError::Validation { block: header.seal_slow(), error })?;
             cursor_td.append(block_number, td.into())?;
         }
         info!(target: "sync::stages::total_difficulty", stage_progress = end_block, is_final_range, "Stage iteration finished");
@@ -194,7 +194,7 @@ mod tests {
         type Seed = Vec<SealedHeader>;
 
         fn seed_execution(&mut self, input: ExecInput) -> Result<Self::Seed, TestRunnerError> {
-            let start = input.checkpoint.unwrap_or_default().block_number;
+            let start = input.checkpoint().block_number;
             let head = random_header(start, None);
             self.tx.insert_headers(std::iter::once(&head))?;
             self.tx.commit(|tx| {
@@ -226,7 +226,7 @@ mod tests {
             input: ExecInput,
             output: Option<ExecOutput>,
         ) -> Result<(), TestRunnerError> {
-            let initial_stage_progress = input.checkpoint.unwrap_or_default().block_number;
+            let initial_stage_progress = input.checkpoint().block_number;
             match output {
                 Some(output) if output.checkpoint.block_number > initial_stage_progress => {
                     self.tx.query(|tx| {

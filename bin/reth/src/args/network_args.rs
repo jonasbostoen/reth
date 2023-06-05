@@ -1,11 +1,11 @@
 //! clap [Args](clap::Args) for network related arguments.
 
-use crate::version::P2P_VERSION;
+use crate::version::P2P_CLIENT_VERSION;
 use clap::Args;
+use reth_config::Config;
 use reth_net_nat::NatResolver;
 use reth_network::{HelloMessage, NetworkConfigBuilder};
 use reth_primitives::{mainnet_nodes, ChainSpec, NodeRecord};
-use reth_staged_sync::Config;
 use secp256k1::SecretKey;
 use std::{path::PathBuf, sync::Arc};
 
@@ -38,7 +38,7 @@ pub struct NetworkArgs {
     pub peers_file: Option<PathBuf>,
 
     /// Custom node identity
-    #[arg(long, value_name = "IDENTITY", default_value = P2P_VERSION)]
+    #[arg(long, value_name = "IDENTITY", default_value = P2P_CLIENT_VERSION)]
     pub identity: String,
 
     /// Secret key to use for this node.

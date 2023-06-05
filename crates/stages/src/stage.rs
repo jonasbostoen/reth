@@ -1,7 +1,10 @@
-use crate::{error::StageError, id::StageId};
+use crate::error::StageError;
 use async_trait::async_trait;
 use reth_db::database::Database;
-use reth_primitives::{BlockNumber, StageCheckpoint};
+use reth_primitives::{
+    stage::{StageCheckpoint, StageId},
+    BlockNumber,
+};
 use reth_provider::Transaction;
 use std::{
     cmp::{max, min},
@@ -45,7 +48,7 @@ impl ExecInput {
         &self,
         threshold: u64,
     ) -> (RangeInclusive<BlockNumber>, bool) {
-        let current_block = self.checkpoint.unwrap_or_default();
+        let current_block = self.checkpoint();
         // +1 is to skip present block and always start from block number 1, not 0.
         let start = current_block.block_number + 1;
         let target = self.previous_stage_checkpoint().block_number;

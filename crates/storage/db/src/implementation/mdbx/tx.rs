@@ -7,9 +7,9 @@ use crate::{
     transaction::{DbTx, DbTxGAT, DbTxMut, DbTxMutGAT},
     DatabaseError,
 };
-use metrics::histogram;
 use parking_lot::RwLock;
 use reth_libmdbx::{EnvironmentKind, Transaction, TransactionKind, WriteFlags, DBI, RW};
+use reth_metrics::metrics::{self, histogram};
 use std::{marker::PhantomData, sync::Arc, time::Instant};
 
 /// Wrapper for the libmdbx transaction.
@@ -85,16 +85,12 @@ impl<'a, K: TransactionKind, E: EnvironmentKind> DbTxMutGAT<'a> for Tx<'_, K, E>
 impl<'a, E: EnvironmentKind> TableImporter<'a> for Tx<'_, RW, E> {}
 
 impl<'tx, K: TransactionKind, E: EnvironmentKind> DbTx<'tx> for Tx<'tx, K, E> {
-    // Iterate over read only values in database.
-    fn cursor_read<T: Table>(&self) -> Result<<Self as DbTxGAT<'_>>::Cursor<T>, DatabaseError> {
-        self.new_cursor()
-    }
-
-    /// Iterate over read only values in database.
-    fn cursor_dup_read<T: DupSort>(
-        &self,
-    ) -> Result<<Self as DbTxGAT<'_>>::DupCursor<T>, DatabaseError> {
-        self.new_cursor()
+    fn get<T: Table>(&self, key: T::Key) -> Result<Option<<T as Table>::Value>, DatabaseError> {
+        self.inner
+            .get(self.get_dbi::<T>()?, key.encode().as_ref())
+            .map_err(|e| DatabaseError::Read(e.into()))?
+            .map(decode_one::<T>)
+            .transpose()
     }
 
     fn commit(self) -> Result<bool, DatabaseError> {
@@ -108,12 +104,16 @@ impl<'tx, K: TransactionKind, E: EnvironmentKind> DbTx<'tx> for Tx<'tx, K, E> {
         drop(self.inner)
     }
 
-    fn get<T: Table>(&self, key: T::Key) -> Result<Option<<T as Table>::Value>, DatabaseError> {
-        self.inner
-            .get(self.get_dbi::<T>()?, key.encode().as_ref())
-            .map_err(|e| DatabaseError::Read(e.into()))?
-            .map(decode_one::<T>)
-            .transpose()
+    // Iterate over read only values in database.
+    fn cursor_read<T: Table>(&self) -> Result<<Self as DbTxGAT<'_>>::Cursor<T>, DatabaseError> {
+        self.new_cursor()
+    }
+
+    /// Iterate over read only values in database.
+    fn cursor_dup_read<T: DupSort>(
+        &self,
+    ) -> Result<<Self as DbTxGAT<'_>>::DupCursor<T>, DatabaseError> {
+        self.new_cursor()
     }
 }
 

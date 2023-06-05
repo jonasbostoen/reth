@@ -1,6 +1,7 @@
 use crate::{
     insert_canonical_block,
     post_state::{PostState, StorageChangeset},
+    providers::get_stage_checkpoint,
 };
 use itertools::{izip, Itertools};
 use reth_db::{
@@ -19,9 +20,11 @@ use reth_db::{
 };
 use reth_interfaces::{db::DatabaseError as DbError, provider::ProviderError};
 use reth_primitives::{
-    keccak256, Account, Address, BlockHash, BlockNumber, ChainSpec, Hardfork, Header, SealedBlock,
-    SealedBlockWithSenders, StageCheckpoint, StorageEntry, TransactionSigned,
-    TransactionSignedEcRecovered, H256, U256,
+    keccak256,
+    stage::{StageCheckpoint, StageId},
+    Account, Address, BlockHash, BlockNumber, ChainSpec, Hardfork, Header, SealedBlock,
+    SealedBlockWithSenders, StorageEntry, TransactionSigned, TransactionSignedEcRecovered, H256,
+    U256,
 };
 use reth_trie::{StateRoot, StateRootError};
 use std::{
@@ -180,9 +183,12 @@ where
         Ok(td.into())
     }
 
-    /// Unwind table by some number key
+    /// Unwind table by some number key.
+    /// Returns number of rows unwound.
+    ///
+    /// Note: Key is not inclusive and specified key would stay in db.
     #[inline]
-    pub fn unwind_table_by_num<T>(&self, num: u64) -> Result<(), DbError>
+    pub fn unwind_table_by_num<T>(&self, num: u64) -> Result<usize, DbError>
     where
         DB: Database,
         T: Table<Key = u64>,
@@ -190,10 +196,11 @@ where
         self.unwind_table::<T, _>(num, |key| key)
     }
 
-    /// Unwind the table to a provided block
+    /// Unwind the table to a provided number key.
+    /// Returns number of rows unwound.
     ///
     /// Note: Key is not inclusive and specified key would stay in db.
-    pub(crate) fn unwind_table<T, F>(&self, key: u64, mut selector: F) -> Result<(), DbError>
+    pub(crate) fn unwind_table<T, F>(&self, key: u64, mut selector: F) -> Result<usize, DbError>
     where
         DB: Database,
         T: Table,
@@ -201,14 +208,17 @@ where
     {
         let mut cursor = self.cursor_write::<T>()?;
         let mut reverse_walker = cursor.walk_back(None)?;
+        let mut deleted = 0;
 
         while let Some(Ok((entry_key, _))) = reverse_walker.next() {
             if selector(entry_key.clone()) <= key {
                 break
             }
-            self.delete::<T>(entry_key, None)?;
+            reverse_walker.delete_current()?;
+            deleted += 1;
         }
-        Ok(())
+
+        Ok(deleted)
     }
 
     /// Unwind a table forward by a [Walker][reth_db::abstraction::cursor::Walker] on another table
@@ -602,7 +612,7 @@ where
 
         // If this is the case then all of the blocks in the range are empty
         if last_transaction < first_transaction {
-            return Ok(Vec::new())
+            return Ok(block_bodies.into_iter().map(|(n, _)| (n, Vec::new())).collect())
         }
 
         // Get transactions and senders
@@ -807,7 +817,8 @@ where
         // iterate in reverse and get plain state.
 
         // Bundle execution changeset to its particular transaction and block
-        let mut block_states: BTreeMap<BlockNumber, PostState> = BTreeMap::new();
+        let mut block_states =
+            BTreeMap::from_iter(block_bodies.iter().map(|(num, _)| (*num, PostState::default())));
 
         let mut plain_accounts_cursor = self.cursor_write::<tables::PlainAccountState>()?;
         let mut plain_storage_cursor = self.cursor_dup_write::<tables::PlainStorageState>()?;
@@ -1272,6 +1283,21 @@ where
                 )?
             }
         }
+        Ok(())
+    }
+
+    /// Get the stage checkpoint.
+    pub fn get_stage_checkpoint(&self, id: StageId) -> Result<Option<StageCheckpoint>, DbError> {
+        get_stage_checkpoint(self.deref(), id)
+    }
+
+    /// Save stage checkpoint.
+    pub fn save_stage_checkpoint(
+        &self,
+        id: StageId,
+        checkpoint: StageCheckpoint,
+    ) -> Result<(), DbError> {
+        self.put::<tables::SyncStage>(id.to_string(), checkpoint)?;
         Ok(())
     }
 

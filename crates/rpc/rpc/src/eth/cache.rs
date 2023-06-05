@@ -24,10 +24,13 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 /// Default cache size for the block cache: 500MB
 ///
 /// With an average block size of ~100kb this should be able to cache ~5000 blocks.
-const DEFAULT_BLOCK_CACHE_SIZE_BYTES: usize = 500 * 1024 * 1024;
+pub const DEFAULT_BLOCK_CACHE_SIZE_BYTES_MB: usize = 500;
 
 /// Default cache size for the receipts cache: 500MB
-const DEFAULT_RECEIPT_CACHE_SIZE_BYTES: usize = 500 * 1024 * 1024;
+pub const DEFAULT_RECEIPT_CACHE_SIZE_BYTES_MB: usize = 500;
+
+/// Default cache size for the env cache: 1MB
+pub const DEFAULT_ENV_CACHE_SIZE_BYTES_MB: usize = 1;
 
 /// The type that can send the response to a requested [Block]
 type BlockResponseSender = oneshot::Sender<Result<Option<Block>>>;
@@ -73,9 +76,9 @@ pub struct EthStateCacheConfig {
 impl Default for EthStateCacheConfig {
     fn default() -> Self {
         Self {
-            max_block_bytes: DEFAULT_BLOCK_CACHE_SIZE_BYTES,
-            max_receipt_bytes: DEFAULT_RECEIPT_CACHE_SIZE_BYTES,
-            max_env_bytes: 1024 * 1024,
+            max_block_bytes: DEFAULT_BLOCK_CACHE_SIZE_BYTES_MB * 1024 * 1024,
+            max_receipt_bytes: DEFAULT_RECEIPT_CACHE_SIZE_BYTES_MB * 1024 * 1024,
+            max_env_bytes: DEFAULT_ENV_CACHE_SIZE_BYTES_MB * 1024 * 1024,
         }
     }
 }
@@ -312,7 +315,7 @@ where
                             if this.full_block_cache.queue(block_hash, Either::Left(response_tx)) {
                                 let client = this.client.clone();
                                 let action_tx = this.action_tx.clone();
-                                this.action_task_spawner.spawn(Box::pin(async move {
+                                this.action_task_spawner.spawn_blocking(Box::pin(async move {
                                     let res = client.block_by_hash(block_hash);
                                     let _ = action_tx
                                         .send(CacheAction::BlockResult { block_hash, res });
@@ -330,7 +333,7 @@ where
                             if this.full_block_cache.queue(block_hash, Either::Right(response_tx)) {
                                 let client = this.client.clone();
                                 let action_tx = this.action_tx.clone();
-                                this.action_task_spawner.spawn(Box::pin(async move {
+                                this.action_task_spawner.spawn_blocking(Box::pin(async move {
                                     let res = client.block_by_hash(block_hash);
                                     let _ = action_tx
                                         .send(CacheAction::BlockResult { block_hash, res });
@@ -350,7 +353,7 @@ where
                             if this.receipts_cache.queue(block_hash, response_tx) {
                                 let client = this.client.clone();
                                 let action_tx = this.action_tx.clone();
-                                this.action_task_spawner.spawn(Box::pin(async move {
+                                this.action_task_spawner.spawn_blocking(Box::pin(async move {
                                     let res = client.receipts_by_block(block_hash.into());
                                     let _ = action_tx
                                         .send(CacheAction::ReceiptsResult { block_hash, res });
@@ -369,7 +372,7 @@ where
                             if this.evm_env_cache.queue(block_hash, response_tx) {
                                 let client = this.client.clone();
                                 let action_tx = this.action_tx.clone();
-                                this.action_task_spawner.spawn(Box::pin(async move {
+                                this.action_task_spawner.spawn_blocking(Box::pin(async move {
                                     let mut cfg = CfgEnv::default();
                                     let mut block_env = BlockEnv::default();
                                     let res = client

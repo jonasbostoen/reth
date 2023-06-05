@@ -467,19 +467,30 @@ mod tests {
         fn headers_range(&self, _range: impl RangeBounds<BlockNumber>) -> Result<Vec<Header>> {
             Ok(vec![])
         }
+
+        fn sealed_headers_range(
+            &self,
+            _range: impl RangeBounds<BlockNumber>,
+        ) -> Result<Vec<SealedHeader>> {
+            Ok(vec![])
+        }
+
+        fn sealed_header(&self, _block_number: BlockNumber) -> Result<Option<SealedHeader>> {
+            Ok(None)
+        }
     }
 
     impl WithdrawalsProvider for Provider {
-        fn latest_withdrawal(&self) -> Result<Option<Withdrawal>> {
-            self.withdrawals_provider.latest_withdrawal()
-        }
-
         fn withdrawals_by_block(
             &self,
             _id: BlockHashOrNumber,
             _timestamp: u64,
         ) -> RethResult<Option<Vec<Withdrawal>>> {
             self.withdrawals_provider.withdrawals_by_block(_id, _timestamp)
+        }
+
+        fn latest_withdrawal(&self) -> Result<Option<Withdrawal>> {
+            self.withdrawals_provider.latest_withdrawal()
         }
     }
 

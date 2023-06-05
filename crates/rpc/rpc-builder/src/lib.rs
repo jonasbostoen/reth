@@ -21,7 +21,7 @@
 //!
 //! # Examples
 //!
-//! Configure only a http server with a selection of [RethRpcModule]s
+//! Configure only an http server with a selection of [RethRpcModule]s
 //!
 //! ```
 //! use reth_network_api::{NetworkInfo, Peers};
@@ -97,6 +97,7 @@
 //! }
 //! ```
 
+use crate::{auth::AuthRpcModule, error::WsHttpSamePortError};
 use constants::*;
 use error::{RpcError, ServerKind};
 use jsonrpsee::{
@@ -110,9 +111,12 @@ use reth_provider::{
     StateProviderFactory,
 };
 use reth_rpc::{
-    eth::{cache::EthStateCache, gas_oracle::GasPriceOracle},
+    eth::{
+        cache::{cache_new_blocks_task, EthStateCache},
+        gas_oracle::GasPriceOracle,
+    },
     AdminApi, DebugApi, EngineEthApi, EthApi, EthFilter, EthPubSub, EthSubscriptionIdProvider,
-    NetApi, TraceApi, TracingCallGuard, TxPoolApi, Web3Api,
+    NetApi, RPCApi, TraceApi, TracingCallGuard, TxPoolApi, Web3Api,
 };
 use reth_rpc_api::{servers::*, EngineApiServer};
 use reth_tasks::TaskSpawner;
@@ -146,10 +150,8 @@ pub mod constants;
 
 // re-export for convenience
 pub use crate::eth::{EthConfig, EthHandlers};
-use crate::{auth::AuthRpcModule, error::WsHttpSamePortError};
 pub use jsonrpsee::server::ServerBuilder;
 pub use reth_ipc::server::{Builder as IpcServerBuilder, Endpoint};
-use reth_rpc::eth::cache::cache_new_blocks_task;
 
 /// Convenience function for starting a server in one step.
 pub async fn launch<Client, Pool, Network, Tasks, Events>(
@@ -264,7 +266,8 @@ where
     /// Configures all [RpcModule]s specific to the given [TransportRpcModuleConfig] which can be
     /// used to start the transport server(s).
     ///
-    /// And also configures the auth server, which also exposes the `eth_` namespace.
+    /// This behaves exactly as [RpcModuleBuilder::build] for the [TransportRpcModules], but also
+    /// configures the auth (engine api) server, which exposes a subset of the `eth_` namespace.
     pub fn build_with_auth_server<EngineApi>(
         self,
         module_config: TransportRpcModuleConfig,
@@ -412,6 +415,20 @@ impl RpcModuleSelection {
             .into_selection()
     }
 
+    /// Returns the [RpcModuleSelection::STANDARD_MODULES] as a selection.
+    pub fn standard_modules() -> Vec<RethRpcModule> {
+        RpcModuleSelection::try_from_selection(RpcModuleSelection::STANDARD_MODULES.iter().copied())
+            .expect("valid selection")
+            .into_selection()
+    }
+
+    /// All modules that are available by default on IPC.
+    ///
+    /// By default all modules are available on IPC.
+    pub fn default_ipc_modules() -> Vec<RethRpcModule> {
+        Self::all_modules()
+    }
+
     /// Creates a new [RpcModuleSelection::Selection] from the given items.
     ///
     /// # Example
@@ -553,6 +570,8 @@ pub enum RethRpcModule {
     Txpool,
     /// `web3_` module
     Web3,
+    /// `rpc_` module
+    Rpc,
 }
 
 // === impl RethRpcModule ===
@@ -766,7 +785,13 @@ where
     ) -> Vec<Methods> {
         let EthHandlers { api: eth_api, cache: eth_cache, filter: eth_filter, pubsub: eth_pubsub } =
             self.with_eth(|eth| eth.clone());
+
+        // Create a copy, so we can list out all the methods for rpc_ api
+        let namespaces: Vec<_> = namespaces.collect();
+
         namespaces
+            .iter()
+            .copied()
             .map(|namespace| {
                 self.modules
                     .entry(namespace)
@@ -806,6 +831,14 @@ where
                         RethRpcModule::Txpool => {
                             TxPoolApi::new(self.pool.clone()).into_rpc().into()
                         }
+                        RethRpcModule::Rpc => RPCApi::new(
+                            namespaces
+                                .iter()
+                                .map(|module| (module.to_string(), "1.0".to_string()))
+                                .collect(),
+                        )
+                        .into_rpc()
+                        .into(),
                     })
                     .clone()
             })
@@ -1474,6 +1507,7 @@ impl RpcServer {
             ws_local_addr: ws_http.ws_local_addr,
             http: None,
             ws: None,
+            ipc_endpoint: None,
             ipc: None,
         };
 
@@ -1484,6 +1518,7 @@ impl RpcServer {
         if let Some((server, module)) =
             ipc_server.and_then(|server| ipc.map(|module| (server, module)))
         {
+            handle.ipc_endpoint = Some(server.endpoint().path().to_string());
             handle.ipc = Some(server.start(module).await?);
         }
 
@@ -1512,6 +1547,7 @@ pub struct RpcServerHandle {
     ws_local_addr: Option<SocketAddr>,
     http: Option<ServerHandle>,
     ws: Option<ServerHandle>,
+    ipc_endpoint: Option<String>,
     ipc: Option<ServerHandle>,
 }
 
@@ -1543,6 +1579,11 @@ impl RpcServerHandle {
         }
 
         Ok(())
+    }
+
+    /// Returns the endpoint of the launched IPC server, if any
+    pub fn ipc_endpoint(&self) -> Option<String> {
+        self.ipc_endpoint.clone()
     }
 
     /// Returns the url to the http server
@@ -1624,6 +1665,7 @@ mod tests {
                 "net" =>  RethRpcModule::Net,
                 "trace" =>  RethRpcModule::Trace,
                 "web3" =>  RethRpcModule::Web3,
+                "rpc" => RethRpcModule::Rpc,
             );
     }
 

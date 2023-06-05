@@ -11,12 +11,8 @@ use reth_db::{
     tables,
     transaction::DbTxMut,
 };
-use reth_primitives::ChainSpec;
+use reth_primitives::{stage::StageId, ChainSpec};
 use reth_staged_sync::utils::{chainspec::genesis_value_parser, init::insert_genesis_state};
-use reth_stages::stages::{
-    ACCOUNT_HASHING, EXECUTION, INDEX_ACCOUNT_HISTORY, INDEX_STORAGE_HISTORY, MERKLE_EXECUTION,
-    MERKLE_UNWIND, STORAGE_HASHING,
-};
 use std::sync::Arc;
 use tracing::info;
 
@@ -65,66 +61,74 @@ impl Command {
 
         let tool = DbTool::new(&db)?;
 
-        match &self.stage {
-            StageEnum::Execution => {
-                tool.db.update(|tx| {
+        tool.db.update(|tx| {
+            match &self.stage {
+                StageEnum::Execution => {
                     tx.clear::<tables::PlainAccountState>()?;
                     tx.clear::<tables::PlainStorageState>()?;
                     tx.clear::<tables::AccountChangeSet>()?;
                     tx.clear::<tables::StorageChangeSet>()?;
                     tx.clear::<tables::Bytecodes>()?;
-                    tx.put::<tables::SyncStage>(EXECUTION.0.to_string(), Default::default())?;
+                    tx.clear::<tables::Receipts>()?;
+                    tx.put::<tables::SyncStage>(
+                        StageId::Execution.to_string(),
+                        Default::default(),
+                    )?;
                     insert_genesis_state::<Env<WriteMap>>(tx, self.chain.genesis())?;
-                    Ok::<_, eyre::Error>(())
-                })??;
-            }
-            StageEnum::Hashing => {
-                tool.db.update(|tx| {
+                }
+                StageEnum::Hashing => {
                     // Clear hashed accounts
                     tx.clear::<tables::HashedAccount>()?;
-                    tx.put::<tables::SyncStageProgress>(ACCOUNT_HASHING.0.into(), Vec::new())?;
-                    tx.put::<tables::SyncStage>(ACCOUNT_HASHING.0.to_string(), Default::default())?;
+                    tx.put::<tables::SyncStage>(
+                        StageId::AccountHashing.to_string(),
+                        Default::default(),
+                    )?;
 
                     // Clear hashed storages
                     tx.clear::<tables::HashedStorage>()?;
-                    tx.put::<tables::SyncStageProgress>(STORAGE_HASHING.0.into(), Vec::new())?;
-                    tx.put::<tables::SyncStage>(STORAGE_HASHING.0.to_string(), Default::default())?;
-
-                    Ok::<_, eyre::Error>(())
-                })??;
-            }
-            StageEnum::Merkle => {
-                tool.db.update(|tx| {
+                    tx.put::<tables::SyncStage>(
+                        StageId::StorageHashing.to_string(),
+                        Default::default(),
+                    )?;
+                }
+                StageEnum::Merkle => {
                     tx.clear::<tables::AccountsTrie>()?;
                     tx.clear::<tables::StoragesTrie>()?;
                     tx.put::<tables::SyncStage>(
-                        MERKLE_EXECUTION.0.to_string(),
+                        StageId::MerkleExecute.to_string(),
                         Default::default(),
                     )?;
-                    tx.put::<tables::SyncStage>(MERKLE_UNWIND.0.to_string(), Default::default())?;
-                    tx.delete::<tables::SyncStageProgress>(MERKLE_EXECUTION.0.into(), None)?;
-                    Ok::<_, eyre::Error>(())
-                })??;
-            }
-            StageEnum::History => {
-                tool.db.update(|tx| {
+                    tx.put::<tables::SyncStage>(
+                        StageId::MerkleUnwind.to_string(),
+                        Default::default(),
+                    )?;
+                    tx.delete::<tables::SyncStageProgress>(
+                        StageId::MerkleExecute.to_string(),
+                        None,
+                    )?;
+                }
+                StageEnum::History => {
                     tx.clear::<tables::AccountHistory>()?;
                     tx.clear::<tables::StorageHistory>()?;
                     tx.put::<tables::SyncStage>(
-                        INDEX_ACCOUNT_HISTORY.0.to_string(),
+                        StageId::IndexAccountHistory.to_string(),
                         Default::default(),
                     )?;
                     tx.put::<tables::SyncStage>(
-                        INDEX_STORAGE_HISTORY.0.to_string(),
+                        StageId::IndexStorageHistory.to_string(),
                         Default::default(),
                     )?;
-                    Ok::<_, eyre::Error>(())
-                })??;
+                }
+                _ => {
+                    info!("Nothing to do for stage {:?}", self.stage);
+                    return Ok(())
+                }
             }
-            _ => {
-                info!("Nothing to do for stage {:?}", self.stage);
-            }
-        }
+
+            tx.put::<tables::SyncStage>(StageId::Finish.to_string(), Default::default())?;
+
+            Ok::<_, eyre::Error>(())
+        })??;
 
         Ok(())
     }

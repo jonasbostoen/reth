@@ -15,6 +15,9 @@ pub mod error;
 ///   blocks from p2p. Do reorg in tables if canonical chain if needed.
 pub trait BlockchainTreeEngine: BlockchainTreeViewer + Send + Sync {
     /// Recover senders and call [`BlockchainTreeEngine::insert_block`].
+    ///
+    /// This will recover all senders of the transactions in the block first, and then try to insert
+    /// the block.
     fn insert_block_without_senders(
         &self,
         block: SealedBlock,
@@ -26,7 +29,10 @@ pub trait BlockchainTreeEngine: BlockchainTreeViewer + Send + Sync {
     }
 
     /// Recover senders and call [`BlockchainTreeEngine::buffer_block`].
-    fn buffer_block_without_sender(&self, block: SealedBlock) -> Result<(), InsertBlockError> {
+    ///
+    /// This will recover all senders of the transactions in the block first, and then try to buffer
+    /// the block.
+    fn buffer_block_without_senders(&self, block: SealedBlock) -> Result<(), InsertBlockError> {
         match block.try_seal_with_senders() {
             Ok(block) => self.buffer_block(block),
             Err(block) => Err(InsertBlockError::sender_recovery_error(block)),
@@ -54,7 +60,8 @@ pub trait BlockchainTreeEngine: BlockchainTreeViewer + Send + Sync {
     /// [`BlockchainTreeEngine::finalize_block`]).
     fn restore_canonical_hashes(&self, last_finalized_block: BlockNumber) -> Result<(), Error>;
 
-    /// Make a block and its parent part of the canonical chain by committing it to the database.
+    /// Make a block and its parent chain part of the canonical chain by committing it to the
+    /// database.
     ///
     /// # Note
     ///
@@ -64,10 +71,43 @@ pub trait BlockchainTreeEngine: BlockchainTreeViewer + Send + Sync {
     /// # Returns
     ///
     /// Returns `Ok` if the blocks were canonicalized, or if the blocks were already canonical.
-    fn make_canonical(&self, block_hash: &BlockHash) -> Result<(), Error>;
+    fn make_canonical(&self, block_hash: &BlockHash) -> Result<CanonicalOutcome, Error>;
 
     /// Unwind tables and put it inside state
     fn unwind(&self, unwind_to: BlockNumber) -> Result<(), Error>;
+}
+
+/// All possible outcomes of a canonicalization attempt of [BlockchainTreeEngine::make_canonical].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CanonicalOutcome {
+    /// The block is already canonical.
+    AlreadyCanonical {
+        /// The corresponding [SealedHeader] that is already canonical.
+        header: SealedHeader,
+    },
+    /// Committed the block to the database.
+    Committed {
+        /// The new corresponding canonical head
+        head: SealedHeader,
+    },
+}
+
+impl CanonicalOutcome {
+    /// Returns the header of the block that was made canonical.
+    pub fn header(&self) -> &SealedHeader {
+        match self {
+            CanonicalOutcome::AlreadyCanonical { header } => header,
+            CanonicalOutcome::Committed { head } => head,
+        }
+    }
+
+    /// Consumes the outcome and returns the header of the block that was made canonical.
+    pub fn into_header(self) -> SealedHeader {
+        match self {
+            CanonicalOutcome::AlreadyCanonical { header } => header,
+            CanonicalOutcome::Committed { head } => head,
+        }
+    }
 }
 
 /// From Engine API spec, block inclusion can be valid, accepted or invalid.
@@ -80,11 +120,14 @@ pub enum BlockStatus {
     /// If block validation is valid and block extends canonical chain.
     /// In BlockchainTree sense it forks on canonical tip.
     Valid,
-    /// If the block is valid, but it does not extend canonical chain
+    /// If the block is valid, but it does not extend canonical chain.
     /// (It is side chain) or hasn't been fully validated but ancestors of a payload are known.
     Accepted,
     /// If blocks is not connected to canonical chain.
-    Disconnected,
+    Disconnected {
+        /// The lowest parent block that is not connected to the canonical chain.
+        missing_parent: BlockNumHash,
+    },
 }
 
 /// Allows read only functionality on the blockchain tree.
@@ -127,6 +170,12 @@ pub trait BlockchainTreeViewer: Send + Sync {
     ///
     /// Note: this could be the given `parent_hash` if it's already canonical.
     fn find_canonical_ancestor(&self, parent_hash: BlockHash) -> Option<BlockHash>;
+
+    /// Given the hash of a block, this checks the buffered blocks for the lowest ancestor in the
+    /// buffer.
+    ///
+    /// If there is a buffered block with the given hash, this returns the block itself.
+    fn lowest_buffered_ancestor(&self, hash: BlockHash) -> Option<SealedBlockWithSenders>;
 
     /// Return BlockchainTree best known canonical chain tip (BlockHash, BlockNumber)
     fn canonical_tip(&self) -> BlockNumHash;

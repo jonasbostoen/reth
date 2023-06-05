@@ -1,4 +1,4 @@
-use crate::{ExecInput, ExecOutput, Stage, StageError, StageId, UnwindInput, UnwindOutput};
+use crate::{ExecInput, ExecOutput, Stage, StageError, UnwindInput, UnwindOutput};
 use futures_util::TryStreamExt;
 use reth_db::{
     cursor::{DbCursorRO, DbCursorRW},
@@ -11,13 +11,10 @@ use reth_interfaces::{
     consensus::Consensus,
     p2p::bodies::{downloader::BodyDownloader, response::BlockResponse},
 };
-use reth_primitives::StageCheckpoint;
+use reth_primitives::stage::{StageCheckpoint, StageId};
 use reth_provider::Transaction;
 use std::sync::Arc;
 use tracing::*;
-
-/// The [`StageId`] of the bodies downloader stage.
-pub const BODIES: StageId = StageId("Bodies");
 
 // TODO(onbjerg): Metrics and events (gradual status for e.g. CLI)
 /// The body stage downloads block bodies.
@@ -62,7 +59,7 @@ pub struct BodyStage<D: BodyDownloader> {
 impl<DB: Database, D: BodyDownloader> Stage<DB> for BodyStage<D> {
     /// Return the id of the stage
     fn id(&self) -> StageId {
-        BODIES
+        StageId::Bodies
     }
 
     /// Download block bodies from the last checkpoint for this stage up until the latest synced
@@ -206,7 +203,7 @@ impl<DB: Database, D: BodyDownloader> Stage<DB> for BodyStage<D> {
             }
 
             // Delete the current body value
-            tx.delete::<tables::BlockBodyIndices>(number, None)?;
+            rev_walker.delete_current()?;
         }
 
         info!(target: "sync::stages::bodies", to_block = input.unwind_to, stage_progress = input.unwind_to, is_final_range = true, "Unwind iteration finished");
@@ -362,10 +359,7 @@ mod tests {
         );
         let checkpoint = output.unwrap().checkpoint;
         runner
-            .validate_db_blocks(
-                input.checkpoint.unwrap_or_default().block_number,
-                checkpoint.block_number,
-            )
+            .validate_db_blocks(input.checkpoint().block_number, checkpoint.block_number)
             .expect("Written block data invalid");
 
         // Delete a transaction
@@ -502,7 +496,7 @@ mod tests {
             type Seed = Vec<SealedBlock>;
 
             fn seed_execution(&mut self, input: ExecInput) -> Result<Self::Seed, TestRunnerError> {
-                let start = input.checkpoint.unwrap_or_default().block_number;
+                let start = input.checkpoint().block_number;
                 let end = input.previous_stage_checkpoint().block_number;
                 let blocks = random_block_range(start..=end, GENESIS_HASH, 0..2);
                 self.tx.insert_headers_with_td(blocks.iter().map(|block| &block.header))?;
@@ -547,7 +541,7 @@ mod tests {
             ) -> Result<(), TestRunnerError> {
                 let highest_block = match output.as_ref() {
                     Some(output) => output.checkpoint,
-                    None => input.checkpoint.unwrap_or_default(),
+                    None => input.checkpoint(),
                 }
                 .block_number;
                 self.validate_db_blocks(highest_block, highest_block)

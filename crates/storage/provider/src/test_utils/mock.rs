@@ -5,6 +5,7 @@ use crate::{
     StateProvider, StateProviderBox, StateProviderFactory, StateRootProvider, TransactionsProvider,
 };
 use parking_lot::Mutex;
+use reth_db::models::StoredBlockBodyIndices;
 use reth_interfaces::{provider::ProviderError, Result};
 use reth_primitives::{
     keccak256, Account, Address, Block, BlockHash, BlockHashOrNumber, BlockId, BlockNumber,
@@ -135,10 +136,7 @@ impl HeaderProvider for MockEthProvider {
         Ok(Some(sum))
     }
 
-    fn headers_range(
-        &self,
-        range: impl RangeBounds<reth_primitives::BlockNumber>,
-    ) -> Result<Vec<Header>> {
+    fn headers_range(&self, range: impl RangeBounds<BlockNumber>) -> Result<Vec<Header>> {
         let lock = self.headers.lock();
 
         let mut headers: Vec<_> =
@@ -146,6 +144,17 @@ impl HeaderProvider for MockEthProvider {
         headers.sort_by_key(|header| header.number);
 
         Ok(headers)
+    }
+
+    fn sealed_headers_range(
+        &self,
+        range: impl RangeBounds<BlockNumber>,
+    ) -> Result<Vec<SealedHeader>> {
+        Ok(self.headers_range(range)?.into_iter().map(|h| h.seal_slow()).collect())
+    }
+
+    fn sealed_header(&self, number: BlockNumber) -> Result<Option<SealedHeader>> {
+        Ok(self.header_by_number(number)?.map(|h| h.seal_slow()))
     }
 }
 
@@ -255,6 +264,10 @@ impl BlockNumProvider for MockEthProvider {
             .ok_or(ProviderError::BestBlockNotFound)?)
     }
 
+    fn last_block_number(&self) -> Result<BlockNumber> {
+        self.best_block_number()
+    }
+
     fn block_number(&self, hash: H256) -> Result<Option<reth_primitives::BlockNumber>> {
         let lock = self.blocks.lock();
         let num = lock.iter().find_map(|(h, b)| (*h == hash).then_some(b.number));
@@ -263,11 +276,11 @@ impl BlockNumProvider for MockEthProvider {
 }
 
 impl BlockIdProvider for MockEthProvider {
-    fn safe_block_num_hash(&self) -> Result<Option<reth_primitives::BlockNumHash>> {
+    fn pending_block_num_hash(&self) -> Result<Option<reth_primitives::BlockNumHash>> {
         Ok(None)
     }
 
-    fn pending_block_num_hash(&self) -> Result<Option<reth_primitives::BlockNumHash>> {
+    fn safe_block_num_hash(&self) -> Result<Option<reth_primitives::BlockNumHash>> {
         Ok(None)
     }
 
@@ -293,7 +306,15 @@ impl BlockProvider for MockEthProvider {
         Ok(None)
     }
 
+    fn pending_header(&self) -> Result<Option<SealedHeader>> {
+        Ok(None)
+    }
+
     fn ommers(&self, _id: BlockHashOrNumber) -> Result<Option<Vec<Header>>> {
+        Ok(None)
+    }
+
+    fn block_body_indices(&self, _num: u64) -> Result<Option<StoredBlockBodyIndices>> {
         Ok(None)
     }
 }

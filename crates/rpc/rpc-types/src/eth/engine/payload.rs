@@ -1,5 +1,5 @@
 use reth_primitives::{
-    constants::MIN_PROTOCOL_BASE_FEE_U256,
+    constants::{MAXIMUM_EXTRA_DATA_SIZE, MIN_PROTOCOL_BASE_FEE_U256},
     proofs::{self, EMPTY_LIST_HASH},
     Address, Block, Bloom, Bytes, Header, SealedBlock, TransactionSigned, UintTryTo, Withdrawal,
     H256, H64, U256, U64,
@@ -126,7 +126,7 @@ impl TryFrom<ExecutionPayload> for SealedBlock {
     type Error = PayloadError;
 
     fn try_from(payload: ExecutionPayload) -> Result<Self, Self::Error> {
-        if payload.extra_data.len() > 32 {
+        if payload.extra_data.len() > MAXIMUM_EXTRA_DATA_SIZE {
             return Err(PayloadError::ExtraData(payload.extra_data))
         }
 
@@ -298,6 +298,16 @@ impl PayloadStatus {
     }
 }
 
+impl std::fmt::Display for PayloadStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "PayloadStatus {{status: {}, latestValidHash: {:?} }}",
+            self.status, self.latest_valid_hash
+        )
+    }
+}
+
 impl Serialize for PayloadStatus {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -313,12 +323,7 @@ impl Serialize for PayloadStatus {
 
 impl From<PayloadError> for PayloadStatusEnum {
     fn from(error: PayloadError) -> Self {
-        match error {
-            error @ PayloadError::BlockHash { .. } => {
-                PayloadStatusEnum::InvalidBlockHash { validation_error: error.to_string() }
-            }
-            _ => PayloadStatusEnum::Invalid { validation_error: error.to_string() },
-        }
+        PayloadStatusEnum::Invalid { validation_error: error.to_string() }
     }
 }
 
@@ -346,10 +351,6 @@ pub enum PayloadStatusEnum {
     /// ACCEPTED is returned by the engine API in the following calls:
     ///   - newPayloadV1: if the payload was accepted, but not processed (side chain)
     Accepted,
-    InvalidBlockHash {
-        #[serde(rename = "validationError")]
-        validation_error: String,
-    },
 }
 
 impl PayloadStatusEnum {
@@ -360,14 +361,12 @@ impl PayloadStatusEnum {
             PayloadStatusEnum::Invalid { .. } => "INVALID",
             PayloadStatusEnum::Syncing => "SYNCING",
             PayloadStatusEnum::Accepted => "ACCEPTED",
-            PayloadStatusEnum::InvalidBlockHash { .. } => "INVALID_BLOCK_HASH",
         }
     }
 
     /// Returns the validation error if the payload status is invalid.
     pub fn validation_error(&self) -> Option<&str> {
         match self {
-            PayloadStatusEnum::InvalidBlockHash { validation_error } |
             PayloadStatusEnum::Invalid { validation_error } => Some(validation_error),
             _ => None,
         }
@@ -387,10 +386,18 @@ impl PayloadStatusEnum {
     pub fn is_invalid(&self) -> bool {
         matches!(self, PayloadStatusEnum::Invalid { .. })
     }
+}
 
-    /// Returns true if the payload status is invalid block hash.
-    pub fn is_invalid_block_hash(&self) -> bool {
-        matches!(self, PayloadStatusEnum::InvalidBlockHash { .. })
+impl std::fmt::Display for PayloadStatusEnum {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PayloadStatusEnum::Invalid { validation_error } => {
+                f.write_str(self.as_str())?;
+                f.write_str(": ")?;
+                f.write_str(validation_error.as_str())
+            }
+            _ => f.write_str(self.as_str()),
+        }
     }
 }
 

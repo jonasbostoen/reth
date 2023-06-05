@@ -3,7 +3,7 @@ use reth_interfaces::{
     consensus, db::DatabaseError as DbError, executor, p2p::error::DownloadError,
     provider::ProviderError,
 };
-use reth_primitives::BlockNumber;
+use reth_primitives::SealedHeader;
 use reth_provider::TransactionError;
 use thiserror::Error;
 use tokio::sync::mpsc::error::SendError;
@@ -12,10 +12,10 @@ use tokio::sync::mpsc::error::SendError;
 #[derive(Error, Debug)]
 pub enum StageError {
     /// The stage encountered a state validation error.
-    #[error("Stage encountered a validation error in block {block}: {error}.")]
+    #[error("Stage encountered a validation error in block {number}: {error}.", number = block.number)]
     Validation {
         /// The block that failed validation.
-        block: BlockNumber,
+        block: SealedHeader,
         /// The underlying consensus error.
         #[source]
         error: consensus::ConsensusError,
@@ -23,19 +23,19 @@ pub enum StageError {
     /// The stage encountered a database error.
     #[error("An internal database error occurred: {0}")]
     Database(#[from] DbError),
-    #[error("Stage encountered a execution error in block {block}: {error}.")]
+    #[error("Stage encountered a execution error in block {number}: {error}.", number = block.number)]
     /// The stage encountered a execution error
     // TODO: Probably redundant, should be rolled into `Validation`
     ExecutionError {
         /// The block that failed execution.
-        block: BlockNumber,
+        block: SealedHeader,
         /// The underlying execution error.
         #[source]
         error: executor::BlockExecutionError,
     },
     /// Invalid checkpoint passed to the stage
-    #[error("Invalid stage progress: {0}")]
-    StageProgress(u64),
+    #[error("Invalid stage checkpoint: {0}")]
+    StageCheckpoint(u64),
     /// Download channel closed
     #[error("Download channel closed")]
     ChannelClosed,
@@ -70,8 +70,7 @@ impl StageError {
             StageError::Database(_) |
                 StageError::Download(_) |
                 StageError::DatabaseIntegrity(_) |
-                StageError::StageProgress(_) |
-                StageError::ExecutionError { .. } |
+                StageError::StageCheckpoint(_) |
                 StageError::ChannelClosed |
                 StageError::Fatal(_) |
                 StageError::Transaction(_)

@@ -19,6 +19,7 @@ use reth_beacon_consensus::{BeaconConsensus, BeaconConsensusEngine};
 use reth_blockchain_tree::{
     config::BlockchainTreeConfig, externals::TreeExternals, BlockchainTree, ShareableBlockchainTree,
 };
+use reth_config::Config;
 use reth_db::{
     database::Database,
     mdbx::{Env, WriteMap},
@@ -40,24 +41,26 @@ use reth_interfaces::{
 };
 use reth_network::{error::NetworkError, NetworkConfig, NetworkHandle, NetworkManager};
 use reth_network_api::NetworkInfo;
-use reth_primitives::{BlockHashOrNumber, ChainSpec, Head, Header, SealedHeader, H256};
-use reth_provider::{BlockProvider, CanonStateSubscriptions, HeaderProvider, ShareableDatabase};
+use reth_primitives::{
+    stage::StageId, BlockHashOrNumber, ChainSpec, Head, Header, SealedHeader, H256,
+};
+use reth_provider::{
+    providers::get_stage_checkpoint, BlockProvider, CanonStateSubscriptions, HeaderProvider,
+    ShareableDatabase,
+};
 use reth_revm::Factory;
 use reth_revm_inspectors::stack::Hook;
 use reth_rpc_engine_api::EngineApi;
-use reth_staged_sync::{
-    utils::{
-        chainspec::genesis_value_parser,
-        init::{init_db, init_genesis},
-        parse_socket_address,
-    },
-    Config,
+use reth_staged_sync::utils::{
+    chainspec::genesis_value_parser,
+    init::{init_db, init_genesis},
+    parse_socket_address,
 };
 use reth_stages::{
     prelude::*,
     stages::{
         ExecutionStage, ExecutionStageThresholds, HeaderSyncMode, SenderRecoveryStage,
-        TotalDifficultyStage, FINISH,
+        TotalDifficultyStage,
     },
 };
 use reth_tasks::TaskExecutor;
@@ -77,7 +80,6 @@ use reth_payload_builder::PayloadBuilderService;
 use reth_primitives::bytes::BytesMut;
 use reth_provider::providers::BlockchainProvider;
 use reth_rlp::Encodable;
-use reth_stages::stages::{MERKLE_EXECUTION, MERKLE_UNWIND};
 
 pub mod events;
 
@@ -328,7 +330,6 @@ impl Command {
 
         // Configure the consensus engine
         let (beacon_consensus_engine, beacon_engine_handle) = BeaconConsensusEngine::with_channel(
-            Arc::clone(&db),
             client,
             pipeline,
             blockchain_db.clone(),
@@ -340,7 +341,7 @@ impl Command {
             initial_target,
             consensus_engine_tx,
             consensus_engine_rx,
-        );
+        )?;
         info!(target: "reth::cli", "Consensus engine initialized");
 
         let events = stream_select(
@@ -492,13 +493,13 @@ impl Command {
             .request_handler(client)
             .split_with_handle();
 
+        task_executor.spawn_critical("p2p txpool", txpool);
+        task_executor.spawn_critical("p2p eth request handler", eth);
+
         let known_peers_file = self.network.persistent_peers_file(default_peers_path);
         task_executor.spawn_critical_with_signal("p2p network task", |shutdown| {
             run_network_until_shutdown(shutdown, network, known_peers_file)
         });
-
-        task_executor.spawn_critical("p2p eth request handler", eth);
-        task_executor.spawn_critical("p2p txpool request handler", txpool);
 
         Ok(handle)
     }
@@ -508,7 +509,7 @@ impl Command {
         db: Arc<Env<WriteMap>>,
     ) -> Result<Head, reth_interfaces::db::DatabaseError> {
         db.view(|tx| {
-            let head = FINISH.get_checkpoint(tx)?.unwrap_or_default().block_number;
+            let head = get_stage_checkpoint(tx, StageId::Finish)?.unwrap_or_default().block_number;
             let header = tx
                 .get::<tables::Headers>(head)?
                 .expect("the header for the latest block is missing, database is corrupt");
@@ -683,8 +684,8 @@ impl Command {
                         max_changesets: stage_conf.execution.max_changesets,
                     },
                 ))
-                .disable_if(MERKLE_UNWIND, || self.auto_mine)
-                .disable_if(MERKLE_EXECUTION, || self.auto_mine),
+                .disable_if(StageId::MerkleUnwind, || self.auto_mine)
+                .disable_if(StageId::MerkleExecute, || self.auto_mine),
             )
             .build(db);
 

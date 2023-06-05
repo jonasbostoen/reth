@@ -119,7 +119,11 @@ impl IpcServer {
 
         let mut connections = FutureDriver::default();
         let incoming = match self.endpoint.incoming() {
-            Ok(connections) => Incoming::new(connections),
+            Ok(connections) => {
+                #[cfg(windows)]
+                let connections = Box::pin(connections);
+                Incoming::new(connections)
+            }
             Err(err) => {
                 on_ready.send(Err(err.to_string())).ok();
                 return Err(err)
@@ -577,7 +581,7 @@ impl<B, L> Builder<B, L> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::client::IpcClientBuilder;
@@ -649,6 +653,21 @@ mod tests {
 
         let client = IpcClientBuilder::default().build(endpoint).await.unwrap();
         let response: String = client.request("eth_chainId", rpc_params![]).await.unwrap();
+        assert_eq!(response, msg);
+    }
+
+    #[tokio::test]
+    async fn test_ipc_modules() {
+        let endpoint = dummy_endpoint();
+        let server = Builder::default().build(&endpoint).unwrap();
+        let mut module = RpcModule::new(());
+        let msg = r#"{"admin":"1.0","debug":"1.0","engine":"1.0","eth":"1.0","ethash":"1.0","miner":"1.0","net":"1.0","rpc":"1.0","txpool":"1.0","web3":"1.0"}"#;
+        module.register_method("rpc_modules", move |_, _| msg).unwrap();
+        let handle = server.start(module).await.unwrap();
+        tokio::spawn(handle.stopped());
+
+        let client = IpcClientBuilder::default().build(endpoint).await.unwrap();
+        let response: String = client.request("rpc_modules", rpc_params![]).await.unwrap();
         assert_eq!(response, msg);
     }
 

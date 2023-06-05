@@ -1,8 +1,5 @@
-use crate::{
-    id::StageId,
-    stage::{ExecOutput, UnwindInput, UnwindOutput},
-};
-use reth_primitives::BlockNumber;
+use crate::stage::{ExecOutput, UnwindInput, UnwindOutput};
+use reth_primitives::stage::{StageCheckpoint, StageId};
 
 /// An event emitted by a [Pipeline][crate::Pipeline].
 ///
@@ -15,13 +12,21 @@ use reth_primitives::BlockNumber;
 pub enum PipelineEvent {
     /// Emitted when a stage is about to be run.
     Running {
+        /// 1-indexed ID of the stage that is about to be run out of total stages in the pipeline.
+        pipeline_position: usize,
+        /// Total number of stages in the pipeline.
+        pipeline_total: usize,
         /// The stage that is about to be run.
         stage_id: StageId,
         /// The previous checkpoint of the stage.
-        stage_progress: Option<BlockNumber>,
+        checkpoint: Option<StageCheckpoint>,
     },
     /// Emitted when a stage has run a single time.
     Ran {
+        /// 1-indexed ID of the stage that was run out of total stages in the pipeline.
+        pipeline_position: usize,
+        /// Total number of stages in the pipeline.
+        pipeline_total: usize,
         /// The stage that was run.
         stage_id: StageId,
         /// The result of executing the stage.

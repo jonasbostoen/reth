@@ -5,6 +5,7 @@ use reth_db::database::Database;
 use reth_interfaces::{
     blockchain_tree::{
         error::InsertBlockError, BlockStatus, BlockchainTreeEngine, BlockchainTreeViewer,
+        CanonicalOutcome,
     },
     consensus::Consensus,
     Error,
@@ -39,22 +40,12 @@ impl<DB: Database, C: Consensus, EF: ExecutorFactory> ShareableBlockchainTree<DB
 impl<DB: Database, C: Consensus, EF: ExecutorFactory> BlockchainTreeEngine
     for ShareableBlockchainTree<DB, C, EF>
 {
-    fn insert_block_without_senders(
-        &self,
-        block: SealedBlock,
-    ) -> Result<BlockStatus, InsertBlockError> {
-        match block.try_seal_with_senders() {
-            Ok(block) => self.tree.write().insert_block_inner(block, true),
-            Err(block) => Err(InsertBlockError::sender_recovery_error(block)),
-        }
-    }
-
     fn buffer_block(&self, block: SealedBlockWithSenders) -> Result<(), InsertBlockError> {
         self.tree.write().buffer_block(block)
     }
 
     fn insert_block(&self, block: SealedBlockWithSenders) -> Result<BlockStatus, InsertBlockError> {
-        trace!(target: "blockchain_tree", ?block, "Inserting block");
+        trace!(target: "blockchain_tree", hash=?block.hash, number=block.number, parent_hash=?block.parent_hash, "Inserting block");
         self.tree.write().insert_block(block)
     }
 
@@ -68,7 +59,7 @@ impl<DB: Database, C: Consensus, EF: ExecutorFactory> BlockchainTreeEngine
         self.tree.write().restore_canonical_hashes(last_finalized_block)
     }
 
-    fn make_canonical(&self, block_hash: &BlockHash) -> Result<(), Error> {
+    fn make_canonical(&self, block_hash: &BlockHash) -> Result<CanonicalOutcome, Error> {
         trace!(target: "blockchain_tree", ?block_hash, "Making block canonical");
         self.tree.write().make_canonical(block_hash)
     }
@@ -115,6 +106,11 @@ impl<DB: Database, C: Consensus, EF: ExecutorFactory> BlockchainTreeViewer
         }
 
         None
+    }
+
+    fn lowest_buffered_ancestor(&self, hash: BlockHash) -> Option<SealedBlockWithSenders> {
+        trace!(target: "blockchain_tree", ?hash, "Returning lowest buffered ancestor");
+        self.tree.read().lowest_buffered_ancestor(&hash).cloned()
     }
 
     fn canonical_tip(&self) -> BlockNumHash {

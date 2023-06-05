@@ -1,6 +1,6 @@
-use crate::{pipeline::BoxedStage, Pipeline, Stage, StageId, StageSet};
+use crate::{pipeline::BoxedStage, Pipeline, Stage, StageSet};
 use reth_db::database::Database;
-use reth_primitives::{BlockNumber, H256};
+use reth_primitives::{stage::StageId, BlockNumber, H256};
 use tokio::sync::watch;
 
 /// Builds a [`Pipeline`].
@@ -13,9 +13,7 @@ where
     stages: Vec<BoxedStage<DB>>,
     /// The maximum block number to sync to.
     max_block: Option<BlockNumber>,
-    /// A receiver for the current chain tip to sync to
-    ///
-    /// Note: this is only used for debugging purposes.
+    /// A receiver for the current chain tip to sync to.
     tip_tx: Option<watch::Sender<H256>>,
 }
 

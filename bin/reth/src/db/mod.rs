@@ -13,6 +13,7 @@ use reth_staged_sync::utils::chainspec::genesis_value_parser;
 use std::sync::Arc;
 use tracing::error;
 
+mod get;
 /// DB List TUI
 mod tui;
 
@@ -60,12 +61,8 @@ pub enum Subcommands {
     Stats,
     /// Lists the contents of a table
     List(ListArgs),
-    /// Seeds the database with random blocks on top of each other
-    Seed {
-        /// How many blocks to generate
-        #[arg(default_value = DEFAULT_NUM_ITEMS)]
-        len: u64,
-    },
+    /// Gets the content of a table for the given key
+    Get(get::Command),
     /// Deletes all database entries
     Drop,
 }
@@ -75,9 +72,12 @@ pub enum Subcommands {
 pub struct ListArgs {
     /// The table name
     table: String, // TODO: Convert to enum
-    /// Where to start iterating
+    /// Skip first N entries
     #[arg(long, short, default_value = "0")]
-    start: usize,
+    skip: usize,
+    /// Reverse the order of the entries. If enabled last table entries are read.
+    #[arg(long, short, default_value = "false")]
+    reverse: bool,
     /// How many items to take from the walker
     #[arg(long, short, default_value = DEFAULT_NUM_ITEMS)]
     len: usize,
@@ -102,7 +102,7 @@ impl Command {
 
         let mut tool = DbTool::new(&db)?;
 
-        match &self.command {
+        match self.command {
             // TODO: We'll need to add this on the DB trait.
             Subcommands::Stats { .. } => {
                 let mut stats_table = ComfyTable::new();
@@ -150,9 +150,6 @@ impl Command {
 
                 println!("{stats_table}");
             }
-            Subcommands::Seed { len } => {
-                tool.seed(*len)?;
-            }
             Subcommands::List(args) => {
                 macro_rules! table_tui {
                     ($arg:expr, $start:expr, $len:expr => [$($table:ident),*]) => {
@@ -174,12 +171,12 @@ impl Command {
                                     }
 
                                     if args.json {
-                                        let list_result = tool.list::<tables::$table>(args.start, args.len)?.into_iter().collect::<Vec<_>>();
+                                        let list_result = tool.list::<tables::$table>(args.skip, args.len,args.reverse)?.into_iter().collect::<Vec<_>>();
                                         println!("{}", serde_json::to_string_pretty(&list_result)?);
                                         Ok(())
                                     } else {
-                                        tui::DbListTUI::<_, tables::$table>::new(|start, count| {
-                                            tool.list::<tables::$table>(start, count).unwrap()
+                                        tui::DbListTUI::<_, tables::$table>::new(|skip, count| {
+                                            tool.list::<tables::$table>(skip, count, args.reverse).unwrap()
                                         }, $start, $len, total_entries).run()
                                     }
                                 })??
@@ -192,7 +189,7 @@ impl Command {
                     }
                 }
 
-                table_tui!(args.table.as_str(), args.start, args.len => [
+                table_tui!(args.table.as_str(), args.skip, args.len => [
                     CanonicalHeaders,
                     HeaderTD,
                     HeaderNumbers,
@@ -219,6 +216,9 @@ impl Command {
                     SyncStage,
                     SyncStageProgress
                 ]);
+            }
+            Subcommands::Get(command) => {
+                command.execute(tool)?;
             }
             Subcommands::Drop => {
                 tool.drop(db_path)?;

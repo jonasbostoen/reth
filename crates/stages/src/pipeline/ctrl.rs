@@ -1,4 +1,4 @@
-use reth_primitives::BlockNumber;
+use reth_primitives::{BlockNumber, SealedHeader};
 
 /// Determines the control flow during pipeline execution.
 #[derive(Debug, Eq, PartialEq)]
@@ -8,7 +8,7 @@ pub enum ControlFlow {
         /// The block to unwind to.
         target: BlockNumber,
         /// The block that caused the unwind.
-        bad_block: Option<BlockNumber>,
+        bad_block: SealedHeader,
     },
     /// The pipeline is allowed to continue executing stages.
     Continue {
@@ -31,5 +31,14 @@ impl ControlFlow {
     /// Returns true if the control flow is unwind.
     pub fn is_unwind(&self) -> bool {
         matches!(self, ControlFlow::Unwind { .. })
+    }
+
+    /// Returns the pipeline progress, if the state is not `Unwind`.
+    pub fn progress(&self) -> Option<BlockNumber> {
+        match self {
+            ControlFlow::Unwind { .. } => None,
+            ControlFlow::Continue { progress } => Some(*progress),
+            ControlFlow::NoProgress { stage_progress } => *stage_progress,
+        }
     }
 }
