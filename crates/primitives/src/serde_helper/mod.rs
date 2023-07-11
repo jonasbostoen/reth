@@ -1,12 +1,17 @@
 //! Various serde utilities
 
-mod storage_key;
-pub use storage_key::*;
+mod storage;
+
+use serde::Serializer;
+pub use storage::*;
 
 mod jsonu256;
+use crate::H256;
 pub use jsonu256::*;
 
 pub mod num;
+mod prune;
+pub use prune::deserialize_opt_prune_mode_with_min_distance;
 
 /// serde functions for handling primitive `u64` as [U64](crate::U64)
 pub mod u64_hex {
@@ -56,6 +61,27 @@ pub mod hex_bytes {
         .map(Into::into)
         .map_err(|e| serde::de::Error::custom(e.to_string()))
     }
+}
+
+/// Serialize a byte vec as a hex string _without_ 0x prefix.
+///
+/// This behaves exactly as [hex::encode]
+pub fn serialize_hex_string_no_prefix<S, T>(x: T, s: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+    T: AsRef<[u8]>,
+{
+    s.serialize_str(&hex::encode(x.as_ref()))
+}
+
+/// Serialize a byte vec as a hex string _without_ 0x prefix
+pub fn serialize_h256_hex_string_no_prefix<S>(x: &H256, s: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    let val = format!("{:?}", x);
+    // skip the 0x prefix
+    s.serialize_str(&val.as_str()[2..])
 }
 
 #[cfg(test)]
