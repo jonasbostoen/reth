@@ -1,9 +1,12 @@
 use crate::{
     post_state::StorageChangeset,
-    traits::{AccountExtReader, BlockSource, ReceiptProvider, StageCheckpointWriter},
+    traits::{
+        AccountExtReader, BlockSource, ChangeSetReader, ReceiptProvider, StageCheckpointWriter,
+    },
     AccountReader, BlockExecutionWriter, BlockHashReader, BlockNumReader, BlockReader, BlockWriter,
     EvmEnvProvider, HashingWriter, HeaderProvider, HistoryWriter, PostState, ProviderError,
-    StageCheckpointReader, StorageReader, TransactionsProvider, WithdrawalsProvider,
+    PruneCheckpointReader, PruneCheckpointWriter, StageCheckpointReader, StorageReader,
+    TransactionsProvider, WithdrawalsProvider,
 };
 use itertools::{izip, Itertools};
 use reth_db::{
@@ -14,7 +17,7 @@ use reth_db::{
         sharded_key, storage_sharded_key::StorageShardedKey, AccountBeforeTx, BlockNumberAddress,
         ShardedKey, StoredBlockBodyIndices, StoredBlockOmmers, StoredBlockWithdrawals,
     },
-    table::Table,
+    table::{Key, Table},
     tables,
     transaction::{DbTx, DbTxMut},
     BlockNumberList, DatabaseError,
@@ -24,9 +27,10 @@ use reth_primitives::{
     keccak256,
     stage::{StageCheckpoint, StageId},
     Account, Address, Block, BlockHash, BlockHashOrNumber, BlockNumber, BlockWithSenders,
-    ChainInfo, ChainSpec, Hardfork, Head, Header, Receipt, SealedBlock, SealedBlockWithSenders,
-    SealedHeader, StorageEntry, TransactionMeta, TransactionSigned, TransactionSignedEcRecovered,
-    TransactionSignedNoHash, TxHash, TxNumber, Withdrawal, H256, U256,
+    ChainInfo, ChainSpec, Hardfork, Head, Header, PruneCheckpoint, PrunePart, Receipt, SealedBlock,
+    SealedBlockWithSenders, SealedHeader, StorageEntry, TransactionMeta, TransactionSigned,
+    TransactionSignedEcRecovered, TransactionSignedNoHash, TxHash, TxNumber, Withdrawal, H256,
+    U256,
 };
 use reth_revm_primitives::{
     config::revm_spec,
@@ -615,6 +619,54 @@ impl<'this, TX: DbTxMut<'this> + DbTx<'this>> DatabaseProvider<'this, TX> {
         Ok(())
     }
 
+    /// Prune the table for the specified key range.
+    /// Returns number of rows pruned.
+    pub fn prune_table<T, K>(
+        &self,
+        range: impl RangeBounds<K>,
+    ) -> std::result::Result<usize, DatabaseError>
+    where
+        T: Table<Key = K>,
+        K: Key,
+    {
+        self.prune_table_in_batches::<T, K, _>(range, usize::MAX, |_| {})
+    }
+
+    /// Prune the table for the specified key range calling `chunk_callback` after every
+    /// `batch_size` pruned rows.
+    ///
+    /// Returns number of rows pruned.
+    pub fn prune_table_in_batches<T, K, F>(
+        &self,
+        range: impl RangeBounds<K>,
+        batch_size: usize,
+        batch_callback: F,
+    ) -> std::result::Result<usize, DatabaseError>
+    where
+        T: Table<Key = K>,
+        K: Key,
+        F: Fn(usize),
+    {
+        let mut cursor = self.tx.cursor_write::<T>()?;
+        let mut walker = cursor.walk_range(range)?;
+        let mut deleted = 0;
+
+        while let Some(Ok(_)) = walker.next() {
+            walker.delete_current()?;
+            deleted += 1;
+
+            if deleted % batch_size == 0 {
+                batch_callback(batch_size);
+            }
+        }
+
+        if deleted % batch_size != 0 {
+            batch_callback(deleted % batch_size);
+        }
+
+        Ok(deleted)
+    }
+
     /// Load shard and remove it. If list is empty, last shard was full or
     /// there are no shards at all.
     fn take_shard<T>(&self, key: T::Key) -> Result<Vec<u64>>
@@ -723,6 +775,20 @@ impl<'this, TX: DbTx<'this>> AccountExtReader for DatabaseProvider<'this, TX> {
         )?;
 
         Ok(account_transitions)
+    }
+}
+
+impl<'this, TX: DbTx<'this>> ChangeSetReader for DatabaseProvider<'this, TX> {
+    fn account_block_changeset(&self, block_number: BlockNumber) -> Result<Vec<AccountBeforeTx>> {
+        let range = block_number..=block_number;
+        self.tx
+            .cursor_read::<tables::AccountChangeSet>()?
+            .walk_range(range)?
+            .map(|result| -> Result<_> {
+                let (_, account_before) = result?;
+                Ok(account_before)
+            })
+            .collect()
     }
 }
 
@@ -934,9 +1000,17 @@ impl<'this, TX: DbTx<'this>> TransactionsProvider for DatabaseProvider<'this, TX
         Ok(self.tx.get::<tables::Transactions>(id)?.map(Into::into))
     }
 
+    fn transaction_by_id_no_hash(&self, id: TxNumber) -> Result<Option<TransactionSignedNoHash>> {
+        Ok(self.tx.get::<tables::Transactions>(id)?)
+    }
+
     fn transaction_by_hash(&self, hash: TxHash) -> Result<Option<TransactionSigned>> {
         if let Some(id) = self.transaction_id(hash)? {
-            Ok(self.transaction_by_id(id)?)
+            Ok(self.transaction_by_id_no_hash(id)?.map(|tx| TransactionSigned {
+                hash,
+                signature: tx.signature,
+                transaction: tx.transaction,
+            }))
         } else {
             Ok(None)
         }
@@ -949,7 +1023,12 @@ impl<'this, TX: DbTx<'this>> TransactionsProvider for DatabaseProvider<'this, TX
     ) -> Result<Option<(TransactionSigned, TransactionMeta)>> {
         let mut transaction_cursor = self.tx.cursor_read::<tables::TransactionBlock>()?;
         if let Some(transaction_id) = self.transaction_id(tx_hash)? {
-            if let Some(transaction) = self.transaction_by_id(transaction_id)? {
+            if let Some(tx) = self.transaction_by_id_no_hash(transaction_id)? {
+                let transaction = TransactionSigned {
+                    hash: tx_hash,
+                    signature: tx.signature,
+                    transaction: tx.transaction,
+                };
                 if let Some(block_number) =
                     transaction_cursor.seek(transaction_id).map(|b| b.map(|(_, bn)| bn))?
                 {
@@ -1077,12 +1156,12 @@ impl<'this, TX: DbTx<'this>> ReceiptProvider for DatabaseProvider<'this, TX> {
                 return if tx_range.is_empty() {
                     Ok(Some(Vec::new()))
                 } else {
-                    let mut tx_cursor = self.tx.cursor_read::<tables::Receipts>()?;
-                    let transactions = tx_cursor
+                    let mut receipts_cursor = self.tx.cursor_read::<tables::Receipts>()?;
+                    let receipts = receipts_cursor
                         .walk_range(tx_range)?
-                        .map(|result| result.map(|(_, tx)| tx))
+                        .map(|result| result.map(|(_, receipt)| receipt))
                         .collect::<std::result::Result<Vec<_>, _>>()?;
-                    Ok(Some(transactions))
+                    Ok(Some(receipts))
                 }
             }
         }
@@ -1214,14 +1293,15 @@ impl<'this, TX: DbTxMut<'this>> StageCheckpointWriter for DatabaseProvider<'this
     ) -> Result<()> {
         // iterate over all existing stages in the table and update its progress.
         let mut cursor = self.tx.cursor_write::<tables::SyncStage>()?;
-        while let Some((stage_name, checkpoint)) = cursor.next()? {
+        for stage_id in StageId::ALL {
+            let (_, checkpoint) = cursor.seek_exact(stage_id.to_string())?.unwrap_or_default();
             cursor.upsert(
-                stage_name,
+                stage_id.to_string(),
                 StageCheckpoint {
                     block_number,
                     ..if drop_stage_checkpoint { Default::default() } else { checkpoint }
                 },
-            )?
+            )?;
         }
 
         Ok(())
@@ -1774,7 +1854,7 @@ impl<'this, TX: DbTxMut<'this> + DbTx<'this>> BlockWriter for DatabaseProvider<'
 
         // Write state and changesets to the database.
         // Must be written after blocks because of the receipt lookup.
-        state.write_to_db(self.tx_ref())?;
+        state.write_to_db(self.tx_ref(), new_tip_number)?;
 
         self.insert_hashes(first_number..=last_block_number, last_block_hash, expected_state_root)?;
 
@@ -1784,5 +1864,17 @@ impl<'this, TX: DbTxMut<'this> + DbTx<'this>> BlockWriter for DatabaseProvider<'
         self.update_pipeline_stages(new_tip_number, false)?;
 
         Ok(())
+    }
+}
+
+impl<'this, TX: DbTx<'this>> PruneCheckpointReader for DatabaseProvider<'this, TX> {
+    fn get_prune_checkpoint(&self, part: PrunePart) -> Result<Option<PruneCheckpoint>> {
+        Ok(self.tx.get::<tables::PruneCheckpoints>(part)?)
+    }
+}
+
+impl<'this, TX: DbTxMut<'this>> PruneCheckpointWriter for DatabaseProvider<'this, TX> {
+    fn save_prune_checkpoint(&self, part: PrunePart, checkpoint: PruneCheckpoint) -> Result<()> {
+        Ok(self.tx.put::<tables::PruneCheckpoints>(part, checkpoint)?)
     }
 }

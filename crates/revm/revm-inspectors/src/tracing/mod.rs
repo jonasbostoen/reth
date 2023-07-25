@@ -146,15 +146,15 @@ impl TracingInspector {
     ///
     /// Invoked on [Inspector::call].
     #[allow(clippy::too_many_arguments)]
-    fn start_trace_on_call(
+    fn start_trace_on_call<DB: Database>(
         &mut self,
-        depth: usize,
+        data: &EVMData<'_, DB>,
         address: Address,
-        data: Bytes,
+        input_data: Bytes,
         value: U256,
         kind: CallKind,
         caller: Address,
-        gas_limit: u64,
+        mut gas_limit: u64,
         maybe_precompile: Option<bool>,
     ) {
         // This will only be true if the inspector is configured to exclude precompiles and the call
@@ -166,14 +166,20 @@ impl TracingInspector {
             PushTraceKind::PushAndAttachToParent
         };
 
+        if self.trace_stack.is_empty() {
+            // this is the root call which should get the original gas limit of the transaction,
+            // because initialization costs are already subtracted from gas_limit
+            gas_limit = data.env.tx.gas_limit;
+        }
+
         self.trace_stack.push(self.traces.push_trace(
             0,
             push_kind,
             CallTrace {
-                depth,
+                depth: data.journaled_state.depth() as usize,
                 address,
                 kind,
-                data,
+                data: input_data,
                 value,
                 status: InstructionResult::Continue,
                 caller,
@@ -230,7 +236,7 @@ impl TracingInspector {
     ///
     /// This expects an existing [CallTrace], in other words, this panics if not within the context
     /// of a call.
-    fn start_step<DB: Database>(&mut self, interp: &mut Interpreter, data: &mut EVMData<'_, DB>) {
+    fn start_step<DB: Database>(&mut self, interp: &Interpreter, data: &EVMData<'_, DB>) {
         let trace_idx = self.last_trace_idx();
         let trace = &mut self.traces.arena[trace_idx];
 
@@ -259,6 +265,7 @@ impl TracingInspector {
             op,
             contract: interp.contract.address,
             stack,
+            new_stack: None,
             memory,
             memory_size: interp.memory.len(),
             gas_remaining: self.gas_inspector.gas_remaining(),
@@ -276,13 +283,17 @@ impl TracingInspector {
     /// Invoked on [Inspector::step_end].
     fn fill_step_on_step_end<DB: Database>(
         &mut self,
-        interp: &mut Interpreter,
-        data: &mut EVMData<'_, DB>,
+        interp: &Interpreter,
+        data: &EVMData<'_, DB>,
         status: InstructionResult,
     ) {
         let StackStep { trace_idx, step_idx } =
             self.step_stack.pop().expect("can't fill step without starting a step first");
         let step = &mut self.traces.arena[trace_idx].trace.steps[step_idx];
+
+        if interp.stack.len() > step.stack.len() {
+            step.new_stack = interp.stack.data().last().copied();
+        }
 
         if self.config.record_memory_snapshots {
             // resize memory so opcodes that allocated memory is correctly displayed
@@ -421,7 +432,7 @@ where
             self.config.exclude_precompile_calls.then(|| self.is_precompile_call(data, &to, value));
 
         self.start_trace_on_call(
-            data.journaled_state.depth() as usize,
+            data,
             to,
             inputs.input.clone(),
             value,
@@ -460,7 +471,7 @@ where
         let _ = data.journaled_state.load_account(inputs.caller, data.db);
         let nonce = data.journaled_state.account(inputs.caller).info.nonce;
         self.start_trace_on_call(
-            data.journaled_state.depth() as usize,
+            data,
             get_create_address(inputs, nonce),
             inputs.init_code.clone(),
             inputs.value,

@@ -78,6 +78,7 @@ use reth_interfaces::p2p::headers::client::HeadersClient;
 use reth_payload_builder::PayloadBuilderService;
 use reth_primitives::DisplayHardforks;
 use reth_provider::providers::BlockchainProvider;
+use reth_prune::BatchSizes;
 use reth_stages::stages::{
     AccountHashingStage, IndexAccountHistoryStage, IndexStorageHistoryStage, MerkleStage,
     StorageHashingStage, TransactionLookupStage,
@@ -241,6 +242,8 @@ impl Command {
                     client,
                     pool,
                     chain_events,
+                    ctx.task_executor.clone(),
+                    Default::default(),
                 ),
             );
             debug!(target: "reth::cli", "Spawned txpool maintenance task");
@@ -360,6 +363,18 @@ impl Command {
             None
         };
 
+        let pruner = config.prune.map(|prune_config| {
+            info!(target: "reth::cli", "Pruner initialized");
+            reth_prune::Pruner::new(
+                db.clone(),
+                self.chain.clone(),
+                prune_config.block_interval,
+                tree_config.max_reorg_depth(),
+                prune_config.parts,
+                BatchSizes::default(),
+            )
+        });
+
         // Configure the consensus engine
         let (beacon_consensus_engine, beacon_engine_handle) = BeaconConsensusEngine::with_channel(
             client,
@@ -374,6 +389,7 @@ impl Command {
             MIN_BLOCKS_FOR_PIPELINE_RUN,
             consensus_engine_tx,
             consensus_engine_rx,
+            pruner,
         )?;
         info!(target: "reth::cli", "Consensus engine initialized");
 
@@ -400,6 +416,7 @@ impl Command {
             self.chain.clone(),
             beacon_engine_handle,
             payload_builder.into(),
+            Box::new(ctx.task_executor.clone()),
         );
         info!(target: "reth::cli", "Engine API handler initialized");
 
@@ -719,6 +736,7 @@ impl Command {
                             max_blocks: stage_config.execution.max_blocks,
                             max_changes: stage_config.execution.max_changes,
                         },
+                        config.prune.map(|prune| prune.parts).unwrap_or_default(),
                     )
                     .with_metrics_tx(metrics_tx),
                 )

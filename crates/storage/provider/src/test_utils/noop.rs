@@ -1,17 +1,19 @@
 use crate::{
     traits::{BlockSource, ReceiptProvider},
     AccountReader, BlockHashReader, BlockIdReader, BlockNumReader, BlockReader, BlockReaderIdExt,
-    ChainSpecProvider, EvmEnvProvider, HeaderProvider, PostState, ReceiptProviderIdExt,
-    StageCheckpointReader, StateProvider, StateProviderBox, StateProviderFactory,
-    StateRootProvider, TransactionsProvider, WithdrawalsProvider,
+    ChainSpecProvider, ChangeSetReader, EvmEnvProvider, HeaderProvider, PostState,
+    PruneCheckpointReader, ReceiptProviderIdExt, StageCheckpointReader, StateProvider,
+    StateProviderBox, StateProviderFactory, StateRootProvider, TransactionsProvider,
+    WithdrawalsProvider,
 };
-use reth_db::models::StoredBlockBodyIndices;
+use reth_db::models::{AccountBeforeTx, StoredBlockBodyIndices};
 use reth_interfaces::Result;
 use reth_primitives::{
     stage::{StageCheckpoint, StageId},
     Account, Address, Block, BlockHash, BlockHashOrNumber, BlockId, BlockNumber, Bytecode, Bytes,
-    ChainInfo, ChainSpec, Header, Receipt, SealedBlock, SealedHeader, StorageKey, StorageValue,
-    TransactionMeta, TransactionSigned, TxHash, TxNumber, H256, KECCAK_EMPTY, MAINNET, U256,
+    ChainInfo, ChainSpec, Header, PruneCheckpoint, PrunePart, Receipt, SealedBlock, SealedHeader,
+    StorageKey, StorageValue, TransactionMeta, TransactionSigned, TransactionSignedNoHash, TxHash,
+    TxNumber, H256, KECCAK_EMPTY, MAINNET, U256,
 };
 use reth_revm_primitives::primitives::{BlockEnv, CfgEnv};
 use std::{ops::RangeBounds, sync::Arc};
@@ -130,6 +132,10 @@ impl TransactionsProvider for NoopProvider {
         Ok(None)
     }
 
+    fn transaction_by_id_no_hash(&self, _id: TxNumber) -> Result<Option<TransactionSignedNoHash>> {
+        Ok(None)
+    }
+
     fn transaction_by_hash(&self, _hash: TxHash) -> Result<Option<TransactionSigned>> {
         Ok(None)
     }
@@ -227,6 +233,12 @@ impl HeaderProvider for NoopProvider {
 impl AccountReader for NoopProvider {
     fn basic_account(&self, _address: Address) -> Result<Option<Account>> {
         Ok(None)
+    }
+}
+
+impl ChangeSetReader for NoopProvider {
+    fn account_block_changeset(&self, _block_number: BlockNumber) -> Result<Vec<AccountBeforeTx>> {
+        Ok(Vec::default())
     }
 }
 
@@ -346,6 +358,12 @@ impl WithdrawalsProvider for NoopProvider {
         _id: BlockHashOrNumber,
         _timestamp: u64,
     ) -> Result<Option<Vec<reth_primitives::Withdrawal>>> {
+        Ok(None)
+    }
+}
+
+impl PruneCheckpointReader for NoopProvider {
+    fn get_prune_checkpoint(&self, _part: PrunePart) -> Result<Option<PruneCheckpoint>> {
         Ok(None)
     }
 }
