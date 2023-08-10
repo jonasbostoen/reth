@@ -460,7 +460,8 @@ impl Future for ActiveSession {
         // If the budget is exhausted we manually yield back control to the (coop) scheduler. This
         // manual yield point should prevent situations where polling appears to be frozen. See also <https://tokio.rs/blog/2020-04-preemption>
         // And tokio's docs on cooperative scheduling <https://docs.rs/tokio/latest/tokio/task/#cooperative-scheduling>
-        let mut budget = 4;
+        // NOTE: changed this from 4 originally because we were hitting the budget quite often.
+        let mut budget = 64;
 
         // The main poll loop that drives the session
         'main: loop {

@@ -627,7 +627,7 @@ where
         // If the budget is exhausted we manually yield back control to the (coop) scheduler. This
         // manual yield point should prevent situations where polling appears to be frozen. See also <https://tokio.rs/blog/2020-04-preemption>
         // And tokio's docs on cooperative scheduling <https://docs.rs/tokio/latest/tokio/task/#cooperative-scheduling>
-        let mut budget = 1024;
+        let mut budget = 2048;
 
         loop {
             // advance the swarm
@@ -877,6 +877,7 @@ where
             // ensure we still have enough budget for another iteration
             budget -= 1;
             if budget == 0 {
+                info!(target: "patch", "NetworkManager budget exhausted");
                 // make sure we're woken up again
                 cx.waker().wake_by_ref();
                 break
