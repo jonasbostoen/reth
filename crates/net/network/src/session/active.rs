@@ -581,11 +581,20 @@ impl Future for ActiveSession {
                             Ok(msg) => {
                                 trace!(target: "net::session", msg_id=?msg.message_id(), remote_peer_id=?this.remote_peer_id, "received eth message");
 
-                                if let EthMessage::Transactions(transactions) = &msg {
-                                    for tx in &transactions.0 {
-                                        debug!(target: "patch::session", tx_hash=?tx.hash(), "Received tx");
+                                match &msg {
+                                    EthMessage::Transactions(transactions) => {
+                                        for tx in &transactions.0 {
+                                            debug!(target: "patch::session", tx_hash=%tx.hash(), "Received direct tx");
+                                        }
                                     }
+                                    EthMessage::PooledTransactions(transactions) => {
+                                        for tx in &transactions.message.0 {
+                                            debug!(target: "patch::session", tx_hash=%tx.hash(), "Received pooled tx");
+                                        }
+                                    }
+                                    _ => {}
                                 }
+
                                 // decode and handle message
                                 match this.on_incoming(msg) {
                                     OnIncomingMessageOutcome::Ok => {
