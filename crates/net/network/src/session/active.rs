@@ -305,7 +305,7 @@ impl ActiveSession {
         {
             Ok(_) => Ok(()),
             Err(err) => {
-                trace!(
+                tracing::error!(
                     target : "net",
                     %err,
                     "no capacity for incoming broadcast",
@@ -540,6 +540,7 @@ impl Future for ActiveSession {
                 // ensure we still have enough budget for another iteration
                 budget -= 1;
                 if budget == 0 {
+                    debug!(target: "patch::session", "Budget exhausted, yielding back to scheduler");
                     // make sure we're woken up again
                     cx.waker().wake_by_ref();
                     break 'main
@@ -579,6 +580,12 @@ impl Future for ActiveSession {
                         match res {
                             Ok(msg) => {
                                 trace!(target: "net::session", msg_id=?msg.message_id(), remote_peer_id=?this.remote_peer_id, "received eth message");
+
+                                if let EthMessage::Transactions(transactions) = &msg {
+                                    for tx in &transactions.0 {
+                                        debug!(target: "patch::session", tx_hash=?tx.hash(), "Received tx");
+                                    }
+                                }
                                 // decode and handle message
                                 match this.on_incoming(msg) {
                                     OnIncomingMessageOutcome::Ok => {
