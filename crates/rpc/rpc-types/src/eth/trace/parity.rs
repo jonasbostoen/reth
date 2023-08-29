@@ -71,8 +71,8 @@ pub enum Delta<T> {
 #[serde(rename_all = "camelCase")]
 pub struct AccountDiff {
     pub balance: Delta<U256>,
-    pub nonce: Delta<U64>,
     pub code: Delta<Bytes>,
+    pub nonce: Delta<U64>,
     pub storage: BTreeMap<H256, Delta<H256>>,
 }
 
@@ -279,7 +279,7 @@ pub struct LocalizedTransactionTrace {
 }
 
 /// A record of a full VM trace for a CALL/CREATE.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VmTrace {
     /// The code to be executed.
@@ -291,14 +291,19 @@ pub struct VmTrace {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VmInstruction {
-    /// The program counter.
-    pub pc: usize,
     /// The gas cost for this instruction.
     pub cost: u64,
     /// Information concerning the execution of the operation.
     pub ex: Option<VmExecutedOperation>,
+    /// The program counter.
+    pub pc: usize,
     /// Subordinate trace of the CALL/CREATE if applicable.
     pub sub: Option<VmTrace>,
+    /// Stringified opcode.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub op: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idx: Option<String>,
 }
 
 /// A record of an executed VM operation.
@@ -308,7 +313,7 @@ pub struct VmExecutedOperation {
     /// The total gas used.
     pub used: u64,
     /// The stack item placed, if any.
-    pub push: Vec<H256>,
+    pub push: Vec<U256>,
     /// If altered, the memory delta.
     pub mem: Option<MemoryDelta>,
     /// The altered storage value, if any.

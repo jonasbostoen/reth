@@ -175,6 +175,8 @@ impl TracingInspector {
         if self.trace_stack.is_empty() {
             // this is the root call which should get the original gas limit of the transaction,
             // because initialization costs are already subtracted from gas_limit
+            // For the root call this value should use the transaction's gas limit
+            // See <https://github.com/paradigmxyz/reth/issues/3678> and <https://github.com/ethereum/go-ethereum/pull/27029>
             gas_limit = data.env.tx.gas_limit;
 
             // we set the spec id here because we only need to do this once and this condition is
@@ -275,7 +277,7 @@ impl TracingInspector {
             op,
             contract: interp.contract.address,
             stack,
-            new_stack: None,
+            push_stack: None,
             memory,
             memory_size: interp.memory.len(),
             gas_remaining: self.gas_inspector.gas_remaining(),
@@ -302,7 +304,8 @@ impl TracingInspector {
         let step = &mut self.traces.arena[trace_idx].trace.steps[step_idx];
 
         if interp.stack.len() > step.stack.len() {
-            step.new_stack = interp.stack.data().last().copied();
+            // if the stack grew, we need to record the new values
+            step.push_stack = Some(interp.stack.data()[step.stack.len()..].to_vec());
         }
 
         if self.config.record_memory_snapshots {

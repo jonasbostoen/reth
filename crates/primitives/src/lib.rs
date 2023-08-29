@@ -23,13 +23,13 @@ pub mod abi;
 mod account;
 pub mod basefee;
 mod bits;
-pub mod blobfee;
 mod block;
 pub mod bloom;
 mod chain;
 mod compression;
 pub mod constants;
 pub mod contract;
+pub mod eip4844;
 mod forkid;
 pub mod fs;
 mod genesis;
@@ -60,13 +60,14 @@ pub use block::{
 };
 pub use bloom::Bloom;
 pub use chain::{
-    AllGenesisFormats, Chain, ChainInfo, ChainSpec, ChainSpecBuilder, DisplayHardforks,
-    ForkCondition, ForkTimestamps, DEV, GOERLI, MAINNET, SEPOLIA,
+    AllGenesisFormats, BaseFeeParams, Chain, ChainInfo, ChainSpec, ChainSpecBuilder,
+    DisplayHardforks, ForkCondition, ForkTimestamps, DEV, GOERLI, MAINNET, SEPOLIA,
 };
 pub use compression::*;
 pub use constants::{
     DEV_GENESIS, EMPTY_OMMER_ROOT, GOERLI_GENESIS, KECCAK_EMPTY, MAINNET_GENESIS, SEPOLIA_GENESIS,
 };
+pub use eip4844::{calculate_excess_blob_gas, kzg_to_versioned_hash};
 pub use forkid::{ForkFilter, ForkHash, ForkId, ForkTransition, ValidationError};
 pub use genesis::{Genesis, GenesisAccount};
 pub use hardfork::Hardfork;
@@ -79,17 +80,22 @@ pub use net::{
     SEPOLIA_BOOTNODES,
 };
 pub use peer::{PeerId, WithPeerId};
-pub use prune::{PruneCheckpoint, PruneMode, PruneModes, PrunePart, PrunePartError};
+pub use prune::{
+    PruneBatchSizes, PruneCheckpoint, PruneMode, PruneModes, PrunePart, PrunePartError,
+    ReceiptsLogPruneConfig, MINIMUM_PRUNING_DISTANCE,
+};
 pub use receipt::{Receipt, ReceiptWithBloom, ReceiptWithBloomRef};
 pub use revm_primitives::JumpMap;
 pub use serde_helper::JsonU256;
 pub use storage::StorageEntry;
 pub use transaction::{
     util::secp256k1::{public_key_to_address, recover_signer, sign_message},
-    AccessList, AccessListItem, AccessListWithGasUsed, FromRecoveredTransaction,
-    IntoRecoveredTransaction, InvalidTransactionError, Signature, Transaction, TransactionKind,
-    TransactionMeta, TransactionSigned, TransactionSignedEcRecovered, TransactionSignedNoHash,
-    TxEip1559, TxEip2930, TxEip4844, TxLegacy, TxType, EIP1559_TX_TYPE_ID, EIP2930_TX_TYPE_ID,
+    AccessList, AccessListItem, AccessListWithGasUsed, BlobTransaction, BlobTransactionSidecar,
+    BlobTransactionValidationError, FromRecoveredPooledTransaction, FromRecoveredTransaction,
+    IntoRecoveredTransaction, InvalidTransactionError, PooledTransactionsElement,
+    PooledTransactionsElementEcRecovered, Signature, Transaction, TransactionKind, TransactionMeta,
+    TransactionSigned, TransactionSignedEcRecovered, TransactionSignedNoHash, TxEip1559, TxEip2930,
+    TxEip4844, TxLegacy, TxType, EIP1559_TX_TYPE_ID, EIP2930_TX_TYPE_ID, EIP4844_TX_TYPE_ID,
     LEGACY_TX_TYPE_ID,
 };
 pub use withdrawal::Withdrawal;
@@ -140,6 +146,11 @@ pub use __reexport::*;
 /// Various utilities
 pub mod utils {
     pub use ethers_core::types::serde_helpers;
+}
+
+/// EIP-4844 + KZG helpers
+pub mod kzg {
+    pub use c_kzg::*;
 }
 
 /// Helpers for working with serde

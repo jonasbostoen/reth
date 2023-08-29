@@ -69,7 +69,11 @@ impl From<BuiltPayload> for ExecutionPayloadEnvelope {
     fn from(value: BuiltPayload) -> Self {
         let BuiltPayload { block, fees, .. } = value;
 
-        ExecutionPayloadEnvelope { block_value: fees, payload: block.into() }
+        ExecutionPayloadEnvelope {
+            block_value: fees,
+            payload: block.into(),
+            should_override_builder: None,
+        }
     }
 }
 
@@ -134,7 +138,9 @@ impl PayloadBuilderAttributes {
             prevrandao: Some(self.prev_randao),
             gas_limit: U256::from(parent.gas_limit),
             // calculate basefee based on parent block's gas usage
-            basefee: U256::from(parent.next_block_base_fee().unwrap_or_default()),
+            basefee: U256::from(
+                parent.next_block_base_fee(chain_spec.base_fee_params).unwrap_or_default(),
+            ),
         };
 
         (cfg, block_env)

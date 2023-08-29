@@ -8,7 +8,7 @@ use crate::{
         DatabaseArgs, DebugArgs, DevArgs, NetworkArgs, PayloadBuilderArgs, PruningArgs,
         RpcServerArgs, TxPoolArgs,
     },
-    cli::ext::RethCliExt,
+    cli::ext::{RethCliExt, RethNodeCommandConfig},
     dirs::{DataDirPath, MaybePlatformPath},
     init::init_genesis,
     node::cl_events::ConsensusLayerHealthEvents,
@@ -22,7 +22,6 @@ use eyre::Context;
 use fdlimit::raise_fd_limit;
 use futures::{future::Either, pin_mut, stream, stream_select, StreamExt};
 use reth_auto_seal_consensus::{AutoSealBuilder, AutoSealConsensus, MiningMode};
-use reth_basic_payload_builder::{BasicPayloadJobGenerator, BasicPayloadJobGeneratorConfig};
 use reth_beacon_consensus::{BeaconConsensus, BeaconConsensusEngine, MIN_BLOCKS_FOR_PIPELINE_RUN};
 use reth_blockchain_tree::{
     config::BlockchainTreeConfig, externals::TreeExternals, BlockchainTree, ShareableBlockchainTree,
@@ -44,7 +43,6 @@ use reth_interfaces::{
 };
 use reth_network::{error::NetworkError, NetworkConfig, NetworkHandle, NetworkManager};
 use reth_network_api::NetworkInfo;
-use reth_payload_builder::PayloadBuilderService;
 use reth_primitives::{
     stage::StageId, BlockHashOrNumber, BlockNumber, ChainSpec, DisplayHardforks, Head,
     SealedHeader, H256,
@@ -53,7 +51,6 @@ use reth_provider::{
     providers::BlockchainProvider, BlockHashReader, BlockReader, CanonStateSubscriptions,
     HeaderProvider, ProviderFactory, StageCheckpointReader,
 };
-use reth_prune::BatchSizes;
 use reth_revm::Factory;
 use reth_revm_inspectors::stack::Hook;
 use reth_rpc_engine_api::EngineApi;
@@ -67,7 +64,9 @@ use reth_stages::{
     MetricEventsSender, MetricsListener,
 };
 use reth_tasks::TaskExecutor;
-use reth_transaction_pool::{EthTransactionValidator, TransactionPool};
+use reth_transaction_pool::{
+    blobstore::InMemoryBlobStore, TransactionPool, TransactionValidationTaskExecutor,
+};
 use secp256k1::SecretKey;
 use std::{
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
@@ -82,7 +81,7 @@ pub mod events;
 
 /// Start the node
 #[derive(Debug, Parser)]
-pub struct Command<Ext: RethCliExt = ()> {
+pub struct NodeCommand<Ext: RethCliExt = ()> {
     /// The path to the data dir for all reth files and subdirectories.
     ///
     /// Defaults to the OS-specific data directory:
@@ -91,11 +90,11 @@ pub struct Command<Ext: RethCliExt = ()> {
     /// - Windows: `{FOLDERID_RoamingAppData}/reth/`
     /// - macOS: `$HOME/Library/Application Support/reth/`
     #[arg(long, value_name = "DATA_DIR", verbatim_doc_comment, default_value_t)]
-    datadir: MaybePlatformPath<DataDirPath>,
+    pub datadir: MaybePlatformPath<DataDirPath>,
 
     /// The path to the configuration file to use.
     #[arg(long, value_name = "FILE", verbatim_doc_comment)]
-    config: Option<PathBuf>,
+    pub config: Option<PathBuf>,
 
     /// The chain this node is running.
     ///
@@ -115,42 +114,88 @@ pub struct Command<Ext: RethCliExt = ()> {
         value_parser = genesis_value_parser,
         required = false,
     )]
-    chain: Arc<ChainSpec>,
+    pub chain: Arc<ChainSpec>,
 
     /// Enable Prometheus metrics.
     ///
     /// The metrics will be served at the given interface and port.
     #[arg(long, value_name = "SOCKET", value_parser = parse_socket_address, help_heading = "Metrics")]
-    metrics: Option<SocketAddr>,
+    pub metrics: Option<SocketAddr>,
 
+    /// All networking related arguments
     #[clap(flatten)]
-    network: NetworkArgs,
+    pub network: NetworkArgs,
 
+    /// All rpc related arguments
     #[clap(flatten)]
-    rpc: RpcServerArgs<Ext::RpcExt>,
+    pub rpc: RpcServerArgs,
 
+    /// All txpool related arguments with --txpool prefix
     #[clap(flatten)]
-    txpool: TxPoolArgs,
+    pub txpool: TxPoolArgs,
 
+    /// All payload builder related arguments
     #[clap(flatten)]
-    builder: PayloadBuilderArgs,
+    pub builder: PayloadBuilderArgs,
 
+    /// All debug related arguments with --debug prefix
     #[clap(flatten)]
-    debug: DebugArgs,
+    pub debug: DebugArgs,
 
+    /// All database related arguments
     #[clap(flatten)]
-    db: DatabaseArgs,
+    pub db: DatabaseArgs,
 
+    /// All dev related arguments with --dev prefix
     #[clap(flatten)]
-    dev: DevArgs,
+    pub dev: DevArgs,
 
+    /// All pruning related arguments
     #[clap(flatten)]
-    pruning: PruningArgs,
+    pub pruning: PruningArgs,
+
+    /// Additional cli arguments
+    #[clap(flatten)]
+    pub ext: Ext::Node,
 }
 
-impl<Ext: RethCliExt> Command<Ext> {
+impl<Ext: RethCliExt> NodeCommand<Ext> {
+    /// Replaces the extension of the node command
+    pub fn with_ext<E: RethCliExt>(self, ext: E::Node) -> NodeCommand<E> {
+        let Self {
+            datadir,
+            config,
+            chain,
+            metrics,
+            network,
+            rpc,
+            txpool,
+            builder,
+            debug,
+            db,
+            dev,
+            pruning,
+            ..
+        } = self;
+        NodeCommand {
+            datadir,
+            config,
+            chain,
+            metrics,
+            network,
+            rpc,
+            txpool,
+            builder,
+            debug,
+            db,
+            dev,
+            pruning,
+            ext,
+        }
+    }
+
     /// Execute `node` command
-    pub async fn execute(self, ctx: CliContext) -> eyre::Result<()> {
+    pub async fn execute(mut self, ctx: CliContext) -> eyre::Result<()> {
         info!(target: "reth::cli", "reth {} starting", SHORT_VERSION);
 
         // Raise the fd limit of the process.
@@ -218,13 +263,16 @@ impl<Ext: RethCliExt> Command<Ext> {
         let factory = ProviderFactory::new(Arc::clone(&db), Arc::clone(&self.chain));
         let blockchain_db = BlockchainProvider::new(factory, blockchain_tree.clone())?;
 
+        let blob_store = InMemoryBlobStore::default();
         let transaction_pool = reth_transaction_pool::Pool::eth_pool(
-            EthTransactionValidator::with_additional_tasks(
+            TransactionValidationTaskExecutor::eth_with_additional_tasks(
                 blockchain_db.clone(),
                 Arc::clone(&self.chain),
+                blob_store.clone(),
                 ctx.task_executor.clone(),
                 1,
             ),
+            blob_store,
             self.txpool.pool_config(),
         );
         info!(target: "reth::cli", "Transaction pool initialized");
@@ -276,22 +324,14 @@ impl<Ext: RethCliExt> Command<Ext> {
 
         let (consensus_engine_tx, consensus_engine_rx) = unbounded_channel();
 
-        let payload_generator = BasicPayloadJobGenerator::new(
+        debug!(target: "reth::cli", "Spawning payload builder service");
+        let payload_builder = self.ext.spawn_payload_builder_service(
+            &self.builder,
             blockchain_db.clone(),
             transaction_pool.clone(),
             ctx.task_executor.clone(),
-            BasicPayloadJobGeneratorConfig::default()
-                .interval(self.builder.interval)
-                .deadline(self.builder.deadline)
-                .max_payload_tasks(self.builder.max_payload_tasks)
-                .extradata(self.builder.extradata_bytes())
-                .max_gas_limit(self.builder.max_gas_limit),
             Arc::clone(&self.chain),
-        );
-        let (payload_service, payload_builder) = PayloadBuilderService::new(payload_generator);
-
-        debug!(target: "reth::cli", "Spawning payload builder service");
-        ctx.task_executor.spawn_critical("payload builder service", payload_service);
+        )?;
 
         let max_block = if let Some(block) = self.debug.max_block {
             Some(block)
@@ -301,7 +341,8 @@ impl<Ext: RethCliExt> Command<Ext> {
             None
         };
 
-        let prune_config = self.pruning.prune_config(Arc::clone(&self.chain)).or(config.prune);
+        let prune_config =
+            self.pruning.prune_config(Arc::clone(&self.chain))?.or(config.prune.clone());
 
         // Configure the pipeline
         let (mut pipeline, client) = if self.dev.dev {
@@ -337,7 +378,7 @@ impl<Ext: RethCliExt> Command<Ext> {
                     db.clone(),
                     &ctx.task_executor,
                     metrics_tx,
-                    prune_config,
+                    prune_config.clone(),
                     max_block,
                 )
                 .await?;
@@ -357,7 +398,7 @@ impl<Ext: RethCliExt> Command<Ext> {
                     db.clone(),
                     &ctx.task_executor,
                     metrics_tx,
-                    prune_config,
+                    prune_config.clone(),
                     max_block,
                 )
                 .await?;
@@ -387,7 +428,7 @@ impl<Ext: RethCliExt> Command<Ext> {
                 self.chain.clone(),
                 prune_config.block_interval,
                 prune_config.parts,
-                BatchSizes::default(),
+                self.chain.prune_batch_sizes,
             )
         });
 
@@ -451,6 +492,7 @@ impl<Ext: RethCliExt> Command<Ext> {
                 blockchain_tree,
                 engine_api,
                 jwt_secret,
+                &mut self.ext,
             )
             .await?;
 
@@ -828,28 +870,28 @@ mod tests {
 
     #[test]
     fn parse_help_node_command() {
-        let err = Command::<()>::try_parse_from(["reth", "--help"]).unwrap_err();
+        let err = NodeCommand::<()>::try_parse_from(["reth", "--help"]).unwrap_err();
         assert_eq!(err.kind(), clap::error::ErrorKind::DisplayHelp);
     }
 
     #[test]
     fn parse_common_node_command_chain_args() {
         for chain in ["mainnet", "sepolia", "goerli"] {
-            let args: Command = Command::<()>::parse_from(["reth", "--chain", chain]);
+            let args: NodeCommand = NodeCommand::<()>::parse_from(["reth", "--chain", chain]);
             assert_eq!(args.chain.chain, chain.parse().unwrap());
         }
     }
 
     #[test]
     fn parse_discovery_port() {
-        let cmd = Command::<()>::try_parse_from(["reth", "--discovery.port", "300"]).unwrap();
+        let cmd = NodeCommand::<()>::try_parse_from(["reth", "--discovery.port", "300"]).unwrap();
         assert_eq!(cmd.network.discovery.port, Some(300));
     }
 
     #[test]
     fn parse_port() {
         let cmd =
-            Command::<()>::try_parse_from(["reth", "--discovery.port", "300", "--port", "99"])
+            NodeCommand::<()>::try_parse_from(["reth", "--discovery.port", "300", "--port", "99"])
                 .unwrap();
         assert_eq!(cmd.network.discovery.port, Some(300));
         assert_eq!(cmd.network.port, Some(99));
@@ -857,26 +899,27 @@ mod tests {
 
     #[test]
     fn parse_metrics_port() {
-        let cmd = Command::<()>::try_parse_from(["reth", "--metrics", "9001"]).unwrap();
+        let cmd = NodeCommand::<()>::try_parse_from(["reth", "--metrics", "9001"]).unwrap();
         assert_eq!(cmd.metrics, Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9001)));
 
-        let cmd = Command::<()>::try_parse_from(["reth", "--metrics", ":9001"]).unwrap();
+        let cmd = NodeCommand::<()>::try_parse_from(["reth", "--metrics", ":9001"]).unwrap();
         assert_eq!(cmd.metrics, Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9001)));
 
-        let cmd = Command::<()>::try_parse_from(["reth", "--metrics", "localhost:9001"]).unwrap();
+        let cmd =
+            NodeCommand::<()>::try_parse_from(["reth", "--metrics", "localhost:9001"]).unwrap();
         assert_eq!(cmd.metrics, Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9001)));
     }
 
     #[test]
     fn parse_config_path() {
-        let cmd =
-            Command::<()>::try_parse_from(["reth", "--config", "my/path/to/reth.toml"]).unwrap();
+        let cmd = NodeCommand::<()>::try_parse_from(["reth", "--config", "my/path/to/reth.toml"])
+            .unwrap();
         // always store reth.toml in the data dir, not the chain specific data dir
         let data_dir = cmd.datadir.unwrap_or_chain_default(cmd.chain.chain);
         let config_path = cmd.config.unwrap_or(data_dir.config_path());
         assert_eq!(config_path, Path::new("my/path/to/reth.toml"));
 
-        let cmd = Command::<()>::try_parse_from(["reth"]).unwrap();
+        let cmd = NodeCommand::<()>::try_parse_from(["reth"]).unwrap();
 
         // always store reth.toml in the data dir, not the chain specific data dir
         let data_dir = cmd.datadir.unwrap_or_chain_default(cmd.chain.chain);
@@ -886,12 +929,13 @@ mod tests {
 
     #[test]
     fn parse_db_path() {
-        let cmd = Command::<()>::try_parse_from(["reth"]).unwrap();
+        let cmd = NodeCommand::<()>::try_parse_from(["reth"]).unwrap();
         let data_dir = cmd.datadir.unwrap_or_chain_default(cmd.chain.chain);
         let db_path = data_dir.db_path();
         assert!(db_path.ends_with("reth/mainnet/db"), "{:?}", cmd.config);
 
-        let cmd = Command::<()>::try_parse_from(["reth", "--datadir", "my/custom/path"]).unwrap();
+        let cmd =
+            NodeCommand::<()>::try_parse_from(["reth", "--datadir", "my/custom/path"]).unwrap();
         let data_dir = cmd.datadir.unwrap_or_chain_default(cmd.chain.chain);
         let db_path = data_dir.db_path();
         assert_eq!(db_path, Path::new("my/custom/path/db"));
@@ -899,7 +943,7 @@ mod tests {
 
     #[test]
     fn parse_dev() {
-        let cmd = Command::<()>::parse_from(["reth", "--dev"]);
+        let cmd = NodeCommand::<()>::parse_from(["reth", "--dev"]);
         let chain = DEV.clone();
         assert_eq!(cmd.chain.chain, chain.chain);
         assert_eq!(cmd.chain.genesis_hash, chain.genesis_hash);

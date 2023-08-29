@@ -1,6 +1,6 @@
 //! Implements the `GetPooledTransactions` and `PooledTransactions` message types.
 use reth_codecs::derive_arbitrary;
-use reth_primitives::{TransactionSigned, H256};
+use reth_primitives::{PooledTransactionsElement, TransactionSigned, H256};
 use reth_rlp::{RlpDecodableWrapper, RlpEncodableWrapper};
 
 #[cfg(feature = "serde")]
@@ -31,23 +31,17 @@ where
 /// as the request's hashes. Hashes may be skipped, and the client should ensure that each body
 /// corresponds to a requested hash. Hashes may need to be re-requested if the bodies are not
 /// included in the response.
-#[derive_arbitrary(rlp, 10)]
+// #[derive_arbitrary(rlp, 10)]
 #[derive(Clone, Debug, PartialEq, Eq, RlpEncodableWrapper, RlpDecodableWrapper, Default)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct PooledTransactions(
     /// The transaction bodies, each of which should correspond to a requested hash.
-    pub Vec<TransactionSigned>,
+    pub Vec<PooledTransactionsElement>,
 );
 
 impl From<Vec<TransactionSigned>> for PooledTransactions {
     fn from(txs: Vec<TransactionSigned>) -> Self {
-        PooledTransactions(txs)
-    }
-}
-
-impl From<PooledTransactions> for Vec<TransactionSigned> {
-    fn from(txs: PooledTransactions) -> Self {
-        txs.0
+        PooledTransactions(txs.into_iter().map(Into::into).collect())
     }
 }
 
