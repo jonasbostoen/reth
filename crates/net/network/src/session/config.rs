@@ -1,9 +1,6 @@
 //! Configuration types for [SessionManager](crate::session::SessionManager).
 
-use crate::{
-    peers::{DEFAULT_MAX_PEERS_INBOUND, DEFAULT_MAX_PEERS_OUTBOUND},
-    session::{Direction, ExceedsSessionLimit},
-};
+use crate::session::{Direction, ExceedsSessionLimit};
 use std::time::Duration;
 
 /// Default request timeout for a single request.
@@ -191,7 +188,7 @@ impl SessionCounter {
     fn ensure(current: u32, limit: Option<u32>) -> Result<(), ExceedsSessionLimit> {
         if let Some(limit) = limit {
             if current >= limit {
-                return Err(ExceedsSessionLimit(limit));
+                return Err(ExceedsSessionLimit(limit))
             }
         }
         Ok(())

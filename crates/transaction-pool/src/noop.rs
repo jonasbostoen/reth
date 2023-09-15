@@ -38,6 +38,7 @@ impl TransactionPool for NoopTransactionPool {
             last_seen_block_hash: Default::default(),
             last_seen_block_number: 0,
             pending_basefee: 0,
+            pending_blob_fee: None,
         }
     }
 
@@ -190,6 +191,16 @@ impl TransactionPool for NoopTransactionPool {
         _tx_hashes: Vec<TxHash>,
     ) -> Result<Vec<(TxHash, BlobTransactionSidecar)>, BlobStoreError> {
         Ok(vec![])
+    }
+
+    fn get_all_blobs_exact(
+        &self,
+        tx_hashes: Vec<TxHash>,
+    ) -> Result<Vec<BlobTransactionSidecar>, BlobStoreError> {
+        if tx_hashes.is_empty() {
+            return Ok(vec![])
+        }
+        Err(BlobStoreError::MissingSidecar(tx_hashes[0]))
     }
 }
 

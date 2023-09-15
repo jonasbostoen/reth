@@ -2,7 +2,8 @@ use crate::{
     error::{BackoffKind, SessionError},
     peers::{
         reputation::{is_banned_reputation, DEFAULT_REPUTATION},
-        ReputationChangeWeights, DEFAULT_MAX_PEERS_INBOUND, DEFAULT_MAX_PEERS_OUTBOUND,
+        ReputationChangeWeights, DEFAULT_MAX_CONCURRENT_DIALS, DEFAULT_MAX_PEERS_INBOUND,
+        DEFAULT_MAX_PEERS_OUTBOUND,
     },
     session::{Direction, PendingSessionHandshakeError},
 };
@@ -210,10 +211,10 @@ impl PeersManager {
         addr: IpAddr,
     ) -> Result<(), InboundConnectionError> {
         if self.ban_list.is_banned_ip(&addr) {
-            return Err(InboundConnectionError::IpBanned);
+            return Err(InboundConnectionError::IpBanned)
         }
         if !self.connection_info.has_in_capacity() {
-            return Err(InboundConnectionError::ExceedsLimit(self.connection_info.max_inbound));
+            return Err(InboundConnectionError::ExceedsLimit(self.connection_info.max_inbound))
         }
         // keep track of new connection
         self.connection_info.inc_in();
@@ -260,7 +261,7 @@ impl PeersManager {
         // on_inbound_pending_session. We also check if the peer is in the backoff list here.
         if self.ban_list.is_banned_peer(&peer_id) {
             self.queued_actions.push_back(PeerAction::DisconnectBannedIncoming { peer_id });
-            return;
+            return
         }
 
         // start a new tick, so the peer is not immediately rewarded for the time since last tick
@@ -271,7 +272,7 @@ impl PeersManager {
                 let value = entry.get_mut();
                 if value.is_banned() {
                     self.queued_actions.push_back(PeerAction::DisconnectBannedIncoming { peer_id });
-                    return;
+                    return
                 }
                 value.state = PeerConnectionState::In;
             }
@@ -336,6 +337,7 @@ impl PeersManager {
         }
     }
 
+    /// Returns the tracked reputation for a peer.
     pub(crate) fn get_reputation(&self, peer_id: &PeerId) -> Option<i32> {
         self.peers.get(peer_id).map(|peer| peer.reputation)
     }
@@ -351,7 +353,7 @@ impl PeersManager {
                 peer.apply_reputation(reputation_change.as_i32())
             }
         } else {
-            return;
+            return
         };
 
         match outcome {
@@ -370,17 +372,19 @@ impl PeersManager {
         }
     }
 
-    /// Gracefully disconnected a pending session
+    /// Gracefully disconnected a pending _outgoing_ session
     pub(crate) fn on_pending_session_gracefully_closed(&mut self, peer_id: &PeerId) {
         if let Some(peer) = self.peers.get_mut(peer_id) {
             peer.state = PeerConnectionState::Idle;
         } else {
-            return;
+            return
         }
-        self.connection_info.decr_out()
+
+        self.connection_info.decr_out();
     }
 
-    /// Invoked when a pending outgoing session was closed during authentication or the handshake.
+    /// Invoked when an _outgoing_ pending session was closed during authentication or the
+    /// handshake.
     pub(crate) fn on_pending_session_dropped(
         &mut self,
         remote_addr: &SocketAddr,
@@ -406,7 +410,7 @@ impl PeersManager {
                     // session to that peer
                     entry.get_mut().severe_backoff_counter = 0;
                     entry.get_mut().state = PeerConnectionState::Idle;
-                    return;
+                    return
                 }
             }
             Entry::Vacant(_) => return,
@@ -428,7 +432,8 @@ impl PeersManager {
         self.on_connection_failure(remote_addr, peer_id, err, ReputationChangeKind::Dropped)
     }
 
-    /// Called when an attempt to create a pending session failed while setting up a tcp connection.
+    /// Called when an attempt to create an _outgoing_ pending session failed while setting up a tcp
+    /// connection.
     pub(crate) fn on_outgoing_connection_failure(
         &mut self,
         remote_addr: &SocketAddr,
@@ -513,7 +518,8 @@ impl PeersManager {
         self.fill_outbound_slots();
     }
 
-    /// Invoked if a session was disconnected because there's already a connection to the peer.
+    /// Invoked if a pending session was disconnected because there's already a connection to the
+    /// peer.
     ///
     /// If the session was an outgoing connection, this means that the peer initiated a connection
     /// to us at the same time and this connection is already established.
@@ -564,7 +570,7 @@ impl PeersManager {
         fork_id: Option<ForkId>,
     ) {
         if self.ban_list.is_banned(&peer_id, &addr.ip()) {
-            return;
+            return
         }
 
         match self.peers.entry(peer_id) {
@@ -580,8 +586,6 @@ impl PeersManager {
                     // disconnecting, See `on_incoming_session_established`
                     peer.remove_after_disconnect = false;
                 }
-
-                return;
             }
             Entry::Vacant(entry) => {
                 trace!(target : "net::peers", ?peer_id, ?addr, "discovered new node");
@@ -591,15 +595,13 @@ impl PeersManager {
                 self.queued_actions.push_back(PeerAction::PeerAdded(peer_id));
             }
         }
-
-        self.fill_outbound_slots();
     }
 
     /// Removes the tracked node from the set.
     pub(crate) fn remove_peer(&mut self, peer_id: PeerId) {
         let Entry::Occupied(entry) = self.peers.entry(peer_id) else { return };
         if entry.get().is_trusted() {
-            return;
+            return
         }
         let mut peer = entry.remove();
 
@@ -626,7 +628,7 @@ impl PeersManager {
     pub(crate) fn remove_peer_from_trusted_set(&mut self, peer_id: PeerId) {
         let Entry::Occupied(mut entry) = self.peers.entry(peer_id) else { return };
         if !entry.get().is_trusted() {
-            return;
+            return
         }
 
         let peer = entry.get_mut();
@@ -645,23 +647,23 @@ impl PeersManager {
     /// Returns `None` if no peer is available.
     fn best_unconnected(&mut self) -> Option<(PeerId, &mut Peer)> {
         let mut unconnected = self.peers.iter_mut().filter(|(_, peer)| {
-            peer.state.is_unconnected()
-                && !peer.is_banned()
-                && !peer.is_backed_off()
-                && (!self.connect_trusted_nodes_only || peer.is_trusted())
+            !peer.is_backed_off() &&
+                !peer.is_banned() &&
+                peer.state.is_unconnected() &&
+                (!self.connect_trusted_nodes_only || peer.is_trusted())
         });
 
         // keep track of the best peer, if there's one
         let mut best_peer = unconnected.next()?;
 
         if best_peer.1.is_trusted() {
-            return Some((*best_peer.0, best_peer.1));
+            return Some((*best_peer.0, best_peer.1))
         }
 
         for maybe_better in unconnected {
             // if the peer is trusted, return it immediately
             if maybe_better.1.is_trusted() {
-                return Some((*maybe_better.0, maybe_better.1));
+                return Some((*maybe_better.0, maybe_better.1))
             }
 
             // otherwise we keep track of the best peer using the reputation
@@ -682,6 +684,7 @@ impl PeersManager {
         self.tick();
 
         // as long as there a slots available try to fill them with the best peers
+        let mut new_outbound_dials = 1;
         while self.connection_info.has_out_capacity() {
             let action = {
                 let (peer_id, peer) = match self.best_unconnected() {
@@ -691,7 +694,7 @@ impl PeersManager {
 
                 // If best peer does not meet reputation threshold exit immediately.
                 if peer.is_banned() {
-                    break;
+                    break
                 }
 
                 info!(target: "patch", ?peer, ?peer_id, total_peers = peer_len, "Peer scheduled for outbound connection");
@@ -703,7 +706,13 @@ impl PeersManager {
             };
 
             self.connection_info.inc_out();
+
             self.queued_actions.push_back(action);
+
+            new_outbound_dials += 1;
+            if new_outbound_dials > self.connection_info.max_concurrent_outbound_dials {
+                break
+            }
         }
     }
 
@@ -715,7 +724,7 @@ impl PeersManager {
         loop {
             // drain buffered actions
             if let Some(action) = self.queued_actions.pop_front() {
-                return Poll::Ready(action);
+                return Poll::Ready(action)
             }
 
             while let Poll::Ready(Some(cmd)) = self.handle_rx.poll_next_unpin(cx) {
@@ -746,7 +755,7 @@ impl PeersManager {
                     if let Some(peer) = self.peers.get_mut(&peer_id) {
                         peer.unban();
                     } else {
-                        continue;
+                        continue
                     }
                     self.queued_actions.push_back(PeerAction::UnBanPeer { peer_id });
                 }
@@ -758,20 +767,18 @@ impl PeersManager {
                         if let Some(peer) = self.peers.get_mut(peer_id) {
                             peer.backed_off = false;
                         }
-                        return false;
+                        return false
                     }
                     true
                 })
             }
 
-            if self.refill_slots_interval.poll_tick(cx).is_ready() {
-                // this ensures the manager will be polled periodically, see [Interval::poll_tick]
-                let _ = self.refill_slots_interval.poll_tick(cx);
+            while self.refill_slots_interval.poll_tick(cx).is_ready() {
                 self.fill_outbound_slots();
             }
 
             if self.queued_actions.is_empty() {
-                return Poll::Pending;
+                return Poll::Pending
             }
         }
     }
@@ -785,7 +792,7 @@ impl Default for PeersManager {
 
 /// Tracks stats about connected nodes
 #[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize), serde(default))]
 pub struct ConnectionInfo {
     /// Counter for currently occupied slots for active outbound connections.
     #[cfg_attr(feature = "serde", serde(skip))]
@@ -797,6 +804,9 @@ pub struct ConnectionInfo {
     max_outbound: usize,
     /// Maximum allowed inbound connections.
     max_inbound: usize,
+    /// Maximum allowed concurrent outbound dials.
+    #[cfg_attr(feature = "serde", serde(default))]
+    max_concurrent_outbound_dials: usize,
 }
 
 // === impl ConnectionInfo ===
@@ -845,6 +855,7 @@ impl Default for ConnectionInfo {
             num_inbound: 0,
             max_outbound: DEFAULT_MAX_PEERS_OUTBOUND,
             max_inbound: DEFAULT_MAX_PEERS_INBOUND,
+            max_concurrent_outbound_dials: DEFAULT_MAX_CONCURRENT_DIALS,
         }
     }
 }
@@ -916,15 +927,15 @@ impl Peer {
 
         if self.state.is_connected() && self.is_banned() {
             self.state.disconnect();
-            return ReputationChangeOutcome::DisconnectAndBan;
+            return ReputationChangeOutcome::DisconnectAndBan
         }
 
         if self.is_banned() && !is_banned_reputation(previous) {
-            return ReputationChangeOutcome::Ban;
+            return ReputationChangeOutcome::Ban
         }
 
         if !self.is_banned() && is_banned_reputation(previous) {
-            return ReputationChangeOutcome::Unban;
+            return ReputationChangeOutcome::Unban
         }
 
         ReputationChangeOutcome::None
@@ -1107,7 +1118,7 @@ pub struct PeersConfig {
 impl Default for PeersConfig {
     fn default() -> Self {
         Self {
-            refill_slots_interval: Duration::from_millis(1_000),
+            refill_slots_interval: Duration::from_millis(5_000),
             connection_info: Default::default(),
             reputation_weights: Default::default(),
             ban_list: Default::default(),
@@ -2179,5 +2190,24 @@ mod test {
         let peer = peers.peers.get(&peer_id).unwrap();
         assert_eq!(peer.state, PeerConnectionState::Idle);
         assert!(!peer.remove_after_disconnect);
+    }
+
+    #[tokio::test]
+    async fn test_max_concurrent_dials() {
+        let config = PeersConfig::default();
+        let mut peer_manager = PeersManager::new(config);
+        let ip = IpAddr::V4(Ipv4Addr::new(127, 0, 1, 2));
+        let socket_addr = SocketAddr::new(ip, 8008);
+        for _ in 0..peer_manager.connection_info.max_concurrent_outbound_dials * 2 {
+            peer_manager.add_peer(PeerId::random(), socket_addr, None);
+        }
+
+        peer_manager.fill_outbound_slots();
+        let dials = peer_manager
+            .queued_actions
+            .iter()
+            .filter(|ev| matches!(ev, PeerAction::Connect { .. }))
+            .count();
+        assert_eq!(dials, peer_manager.connection_info.max_concurrent_outbound_dials);
     }
 }

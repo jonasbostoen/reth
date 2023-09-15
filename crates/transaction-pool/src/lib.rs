@@ -165,8 +165,8 @@ use std::{
 use tokio::sync::mpsc::Receiver;
 use tracing::{instrument, trace};
 
-use crate::blobstore::{BlobStore, BlobStoreError};
 pub use crate::{
+    blobstore::{BlobStore, BlobStoreError},
     config::{
         PoolConfig, PriceBumpConfig, SubPoolLimit, DEFAULT_PRICE_BUMP, REPLACE_BLOB_PRICE_BUMP,
         TXPOOL_MAX_ACCOUNT_SLOTS_PER_SENDER, TXPOOL_SUBPOOL_MAX_SIZE_MB_DEFAULT,
@@ -480,6 +480,13 @@ where
         tx_hashes: Vec<TxHash>,
     ) -> Result<Vec<(TxHash, BlobTransactionSidecar)>, BlobStoreError> {
         self.pool.blob_store().get_all(tx_hashes)
+    }
+
+    fn get_all_blobs_exact(
+        &self,
+        tx_hashes: Vec<TxHash>,
+    ) -> Result<Vec<BlobTransactionSidecar>, BlobStoreError> {
+        self.pool.blob_store().get_exact(tx_hashes)
     }
 }
 
