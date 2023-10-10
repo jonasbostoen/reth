@@ -368,12 +368,7 @@ impl ActiveSession {
             remote_addr: self.remote_addr,
         };
 
-<<<<<<< HEAD
-        self.terminate_message =
-            Some((PollSender::new(self.to_session_manager.inner().clone()), msg));
-=======
         self.terminate_message = Some((self.to_session_manager.inner().clone(), msg));
->>>>>>> 1cccd097ebe460ec989719a9fde0834a15313cdd
         self.poll_terminate_message(cx).expect("message is set")
     }
 
@@ -384,12 +379,7 @@ impl ActiveSession {
             remote_addr: self.remote_addr,
             error,
         };
-<<<<<<< HEAD
-        self.terminate_message =
-            Some((PollSender::new(self.to_session_manager.inner().clone()), msg));
-=======
         self.terminate_message = Some((self.to_session_manager.inner().clone(), msg));
->>>>>>> 1cccd097ebe460ec989719a9fde0834a15313cdd
         self.poll_terminate_message(cx).expect("message is set")
     }
 
