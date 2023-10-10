@@ -1,6 +1,7 @@
 #![allow(dead_code, unused)]
 use crate::{
-    identifier::TransactionId, pool::size::SizeTracker, PoolTransaction, ValidPoolTransaction,
+    identifier::TransactionId, pool::size::SizeTracker, traits::BestTransactionsAttributes,
+    PoolTransaction, ValidPoolTransaction,
 };
 use std::{
     cmp::Ordering,
@@ -26,7 +27,7 @@ pub(crate) struct BlobTransactions<T: PoolTransaction> {
     all: BTreeSet<BlobTransaction<T>>,
     /// Keeps track of the size of this pool.
     ///
-    /// See also [`PoolTransaction::size`](crate::traits::PoolTransaction::size).
+    /// See also [`PoolTransaction::size`].
     size_of: SizeTracker,
 }
 
@@ -76,6 +77,14 @@ impl<T: PoolTransaction> BlobTransactions<T> {
         Some(tx)
     }
 
+    /// Returns all transactions that satisfy the given basefee and blob_fee.
+    pub(crate) fn satisfy_attributes(
+        &self,
+        best_transactions_attributes: BestTransactionsAttributes,
+    ) -> Vec<Arc<ValidPoolTransaction<T>>> {
+        Vec::new()
+    }
+
     fn next_id(&mut self) -> u64 {
         let id = self.submission_id;
         self.submission_id = self.submission_id.wrapping_add(1);
@@ -97,6 +106,12 @@ impl<T: PoolTransaction> BlobTransactions<T> {
     #[allow(unused)]
     pub(crate) fn contains(&self, id: &TransactionId) -> bool {
         self.by_id.contains_key(id)
+    }
+
+    /// Asserts that the bijection between `by_id` and `all` is valid.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(crate) fn assert_invariants(&self) {
+        assert_eq!(self.by_id.len(), self.all.len(), "by_id.len() != all.len()");
     }
 }
 
