@@ -1,9 +1,9 @@
 use crate::tracing::{
-    types::{CallKind, LogCallOrder, RawLog},
+    types::{CallKind, LogCallOrder},
     utils::get_create_address,
 };
+use alloy_primitives::{Address, Bytes, Log, B256, U256};
 pub use arena::CallTraceArena;
-use reth_primitives::{Address, Bytes, B256, U256};
 use revm::{
     inspectors::GasInspector,
     interpreter::{
@@ -20,18 +20,19 @@ mod builder;
 mod config;
 mod fourbyte;
 mod opcount;
-mod types;
+pub mod types;
 mod utils;
+use self::parity::stack_push_count;
 use crate::tracing::{
     arena::PushTraceKind,
-    types::{CallTraceNode, StorageChange, StorageChangeReason},
+    types::{CallTraceNode, RecordedMemory, StorageChange, StorageChangeReason},
     utils::gas_used,
 };
 pub use builder::{
     geth::{self, GethTraceBuilder},
     parity::{self, ParityTraceBuilder},
 };
-pub use config::TracingInspectorConfig;
+pub use config::{StackSnapshotType, TracingInspectorConfig};
 pub use fourbyte::FourByteInspector;
 pub use opcount::OpcodeCountInspector;
 
@@ -80,6 +81,16 @@ impl TracingInspector {
             gas_inspector: Default::default(),
             spec_id: None,
         }
+    }
+
+    /// Gets a reference to the recorded call traces.
+    pub fn get_traces(&self) -> &CallTraceArena {
+        &self.traces
+    }
+
+    /// Gets a mutable reference to the recorded call traces.
+    pub fn get_traces_mut(&mut self) -> &mut CallTraceArena {
+        &mut self.traces
     }
 
     /// Manually the gas used of the root trace.
@@ -133,7 +144,7 @@ impl TracingInspector {
     ) -> bool {
         if data.precompiles.contains(to) {
             // only if this is _not_ the root call
-            return self.is_deep() && value == U256::ZERO
+            return self.is_deep() && value.is_zero()
         }
         false
     }
@@ -271,16 +282,22 @@ impl TracingInspector {
     ///
     /// This expects an existing [CallTrace], in other words, this panics if not within the context
     /// of a call.
-    fn start_step<DB: Database>(&mut self, interp: &Interpreter, data: &EVMData<'_, DB>) {
+    fn start_step<DB: Database>(&mut self, interp: &Interpreter<'_>, data: &EVMData<'_, DB>) {
         let trace_idx = self.last_trace_idx();
         let trace = &mut self.traces.arena[trace_idx];
 
         self.step_stack.push(StackStep { trace_idx, step_idx: trace.trace.steps.len() });
 
-        let memory =
-            self.config.record_memory_snapshots.then(|| interp.memory.clone()).unwrap_or_default();
-        let stack =
-            self.config.record_stack_snapshots.then(|| interp.stack.clone()).unwrap_or_default();
+        let memory = self
+            .config
+            .record_memory_snapshots
+            .then(|| RecordedMemory::new(interp.shared_memory.context_memory().to_vec()))
+            .unwrap_or_default();
+        let stack = if self.config.record_stack_snapshots.is_full() {
+            Some(interp.stack.data().clone())
+        } else {
+            None
+        };
 
         let op = OpCode::new(interp.current_opcode())
             .or_else(|| {
@@ -299,8 +316,8 @@ impl TracingInspector {
             contract: interp.contract.address,
             stack,
             push_stack: None,
+            memory_size: memory.len(),
             memory,
-            memory_size: interp.memory.len(),
             gas_remaining: self.gas_inspector.gas_remaining(),
             gas_refund_counter: interp.gas.refunded() as u64,
 
@@ -316,27 +333,27 @@ impl TracingInspector {
     /// Invoked on [Inspector::step_end].
     fn fill_step_on_step_end<DB: Database>(
         &mut self,
-        interp: &Interpreter,
+        interp: &Interpreter<'_>,
         data: &EVMData<'_, DB>,
-        status: InstructionResult,
     ) {
         let StackStep { trace_idx, step_idx } =
             self.step_stack.pop().expect("can't fill step without starting a step first");
         let step = &mut self.traces.arena[trace_idx].trace.steps[step_idx];
 
-        if interp.stack.len() > step.stack.len() {
-            // if the stack grew, we need to record the new values
-            step.push_stack = Some(interp.stack.data()[step.stack.len()..].to_vec());
+        if self.config.record_stack_snapshots.is_pushes() {
+            let num_pushed = stack_push_count(step.op);
+            let start = interp.stack.len() - num_pushed;
+            step.push_stack = Some(interp.stack.data()[start..].to_vec());
         }
 
         if self.config.record_memory_snapshots {
             // resize memory so opcodes that allocated memory is correctly displayed
-            if interp.memory.len() > step.memory.len() {
-                step.memory.resize(interp.memory.len());
+            if interp.shared_memory.len() > step.memory.len() {
+                step.memory.resize(interp.shared_memory.len());
             }
         }
         if self.config.record_state_diff {
-            let op = interp.current_opcode();
+            let op = step.op.get();
 
             let journal_entry = data
                 .journaled_state
@@ -371,7 +388,7 @@ impl TracingInspector {
         step.gas_cost = step.gas_remaining - self.gas_inspector.gas_remaining();
 
         // set the status
-        step.status = status;
+        step.status = interp.instruction_result;
     }
 }
 
@@ -379,21 +396,15 @@ impl<DB> Inspector<DB> for TracingInspector
 where
     DB: Database,
 {
-    fn initialize_interp(
-        &mut self,
-        interp: &mut Interpreter,
-        data: &mut EVMData<'_, DB>,
-    ) -> InstructionResult {
+    fn initialize_interp(&mut self, interp: &mut Interpreter<'_>, data: &mut EVMData<'_, DB>) {
         self.gas_inspector.initialize_interp(interp, data)
     }
 
-    fn step(&mut self, interp: &mut Interpreter, data: &mut EVMData<'_, DB>) -> InstructionResult {
+    fn step(&mut self, interp: &mut Interpreter<'_>, data: &mut EVMData<'_, DB>) {
         if self.config.record_steps {
             self.gas_inspector.step(interp, data);
             self.start_step(interp, data);
         }
-
-        InstructionResult::Continue
     }
 
     fn log(
@@ -410,21 +421,15 @@ where
 
         if self.config.record_logs {
             trace.ordering.push(LogCallOrder::Log(trace.logs.len()));
-            trace.logs.push(RawLog { topics: topics.to_vec(), data: data.clone() });
+            trace.logs.push(Log::new_unchecked(topics.to_vec(), data.clone()));
         }
     }
 
-    fn step_end(
-        &mut self,
-        interp: &mut Interpreter,
-        data: &mut EVMData<'_, DB>,
-        eval: InstructionResult,
-    ) -> InstructionResult {
+    fn step_end(&mut self, interp: &mut Interpreter<'_>, data: &mut EVMData<'_, DB>) {
         if self.config.record_steps {
-            self.gas_inspector.step_end(interp, data, eval);
-            self.fill_step_on_step_end(interp, data, eval);
+            self.gas_inspector.step_end(interp, data);
+            self.fill_step_on_step_end(interp, data);
         }
-        InstructionResult::Continue
     }
 
     fn call(

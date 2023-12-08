@@ -5,6 +5,7 @@ use super::EthApiSpec;
 use crate::{
     eth::{
         api::{EthApi, EthTransactions},
+        error::EthApiError,
         revm_utils::EvmOverrides,
     },
     result::{internal_rpc_err, ToRpcResult},
@@ -13,7 +14,7 @@ use jsonrpsee::core::RpcResult as Result;
 use reth_network_api::NetworkInfo;
 use reth_primitives::{
     serde_helper::{num::U64HexOrNumber, JsonStorageKey},
-    AccessListWithGasUsed, Address, BlockId, BlockNumberOrTag, Bytes, B256, B64, U256, U64,
+    Address, BlockId, BlockNumberOrTag, Bytes, B256, B64, U256, U64,
 };
 use reth_provider::{
     BlockIdReader, BlockReader, BlockReaderIdExt, ChainSpecProvider, EvmEnvProvider,
@@ -21,9 +22,9 @@ use reth_provider::{
 };
 use reth_rpc_api::EthApiServer;
 use reth_rpc_types::{
-    state::StateOverride, BlockOverrides, Bundle, CallRequest, EIP1186AccountProofResponse,
-    EthCallResponse, FeeHistory, Index, RichBlock, StateContext, SyncStatus, TransactionReceipt,
-    TransactionRequest, Work,
+    state::StateOverride, AccessListWithGasUsed, BlockOverrides, Bundle, CallRequest,
+    EIP1186AccountProofResponse, EthCallResponse, FeeHistory, Index, RichBlock, StateContext,
+    SyncStatus, TransactionReceipt, TransactionRequest, Work,
 };
 use reth_transaction_pool::TransactionPool;
 use serde_json::Value;
@@ -125,12 +126,9 @@ where
     }
 
     /// Handler for: `eth_getBlockReceipts`
-    async fn block_receipts(
-        &self,
-        number: BlockNumberOrTag,
-    ) -> Result<Option<Vec<TransactionReceipt>>> {
-        trace!(target: "rpc::eth", ?number, "Serving eth_getBlockReceipts");
-        Ok(EthApi::block_receipts(self, number).await?)
+    async fn block_receipts(&self, block_id: BlockId) -> Result<Option<Vec<TransactionReceipt>>> {
+        trace!(target: "rpc::eth", ?block_id, "Serving eth_getBlockReceipts");
+        Ok(EthApi::block_receipts(self, block_id).await?)
     }
 
     /// Handler for: `eth_getUncleByBlockHashAndIndex`
@@ -268,12 +266,14 @@ where
         &self,
         request: CallRequest,
         block_number: Option<BlockId>,
+        state_override: Option<StateOverride>,
     ) -> Result<U256> {
         trace!(target: "rpc::eth", ?request, ?block_number, "Serving eth_estimateGas");
         Ok(self
             .estimate_gas_at(
                 request,
                 block_number.unwrap_or(BlockId::Number(BlockNumberOrTag::Latest)),
+                state_override,
             )
             .await?)
     }
@@ -282,6 +282,12 @@ where
     async fn gas_price(&self) -> Result<U256> {
         trace!(target: "rpc::eth", "Serving eth_gasPrice");
         return Ok(EthApi::gas_price(self).await?)
+    }
+
+    /// Handler for: `eth_blobGasPrice`
+    async fn blob_gas_price(&self) -> Result<U256> {
+        trace!(target: "rpc::eth", "Serving eth_blobGasPrice");
+        return Ok(EthApi::blob_gas_price(self).await?)
     }
 
     /// Handler for: `eth_maxPriorityFeePerGas`
@@ -368,36 +374,37 @@ where
     /// Handler for: `eth_getProof`
     async fn get_proof(
         &self,
-        _address: Address,
-        _keys: Vec<JsonStorageKey>,
-        _block_number: Option<BlockId>,
+        address: Address,
+        keys: Vec<JsonStorageKey>,
+        block_number: Option<BlockId>,
     ) -> Result<EIP1186AccountProofResponse> {
-        // TODO: uncomment when implemented
-        // trace!(target: "rpc::eth", ?address, ?keys, ?block_number, "Serving eth_getProof");
-        // let res = EthApi::get_proof(self, address, keys, block_number);
+        trace!(target: "rpc::eth", ?address, ?keys, ?block_number, "Serving eth_getProof");
+        let res = EthApi::get_proof(self, address, keys, block_number).await;
 
-        // Ok(res.map_err(|e| match e {
-        //     EthApiError::InvalidBlockRange => {
-        //         internal_rpc_err("eth_getProof is unimplemented for historical blocks")
-        //     }
-        //     _ => e.into(),
-        // })?)
-        Err(internal_rpc_err("unimplemented"))
+        Ok(res.map_err(|e| match e {
+            EthApiError::InvalidBlockRange => {
+                internal_rpc_err("eth_getProof is unimplemented for historical blocks")
+            }
+            _ => e.into(),
+        })?)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use crate::{
-        eth::{cache::EthStateCache, gas_oracle::GasPriceOracle},
-        EthApi, TracingCallPool,
+        eth::{
+            cache::EthStateCache, gas_oracle::GasPriceOracle, FeeHistoryCache,
+            FeeHistoryCacheConfig,
+        },
+        BlockingTaskPool, EthApi,
     };
     use jsonrpsee::types::error::INVALID_PARAMS_CODE;
     use reth_interfaces::test_utils::{generators, generators::Rng};
     use reth_network_api::noop::NoopNetwork;
     use reth_primitives::{
         basefee::calculate_next_block_base_fee, constants::ETHEREUM_BLOCK_GAS_LIMIT, BaseFeeParams,
-        Block, BlockNumberOrTag, Header, TransactionSigned, U256,
+        Block, BlockNumberOrTag, Header, TransactionSigned, B256, U256,
     };
     use reth_provider::{
         test_utils::{MockEthProvider, NoopProvider},
@@ -406,7 +413,6 @@ mod tests {
     use reth_rpc_api::EthApiServer;
     use reth_rpc_types::FeeHistory;
     use reth_transaction_pool::test_utils::{testing_pool, TestPool};
-    use revm_primitives::B256;
 
     fn build_test_eth_api<
         P: BlockReaderIdExt
@@ -421,14 +427,19 @@ mod tests {
         provider: P,
     ) -> EthApi<P, TestPool, NoopNetwork> {
         let cache = EthStateCache::spawn(provider.clone(), Default::default());
+
+        let fee_history_cache =
+            FeeHistoryCache::new(cache.clone(), FeeHistoryCacheConfig::default());
+
         EthApi::new(
             provider.clone(),
             testing_pool(),
             NoopNetwork::default(),
             cache.clone(),
-            GasPriceOracle::new(provider, Default::default(), cache),
+            GasPriceOracle::new(provider.clone(), Default::default(), cache.clone()),
             ETHEREUM_BLOCK_GAS_LIMIT,
-            TracingCallPool::build().expect("failed to build tracing pool"),
+            BlockingTaskPool::build().expect("failed to build tracing pool"),
+            fee_history_cache,
         )
     }
 
@@ -445,6 +456,7 @@ mod tests {
         let mut gas_used_ratios = Vec::new();
         let mut base_fees_per_gas = Vec::new();
         let mut last_header = None;
+        let mut parent_hash = B256::default();
 
         for i in (0..block_count).rev() {
             let hash = rng.gen();
@@ -458,9 +470,11 @@ mod tests {
                 gas_limit,
                 gas_used,
                 base_fee_per_gas,
+                parent_hash,
                 ..Default::default()
             };
             last_header = Some(header.clone());
+            parent_hash = hash;
 
             let mut transactions = vec![];
             for _ in 0..100 {

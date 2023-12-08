@@ -1,10 +1,9 @@
 use crate::{
     basefee::calculate_next_block_base_fee,
+    constants::{EMPTY_OMMER_ROOT_HASH, EMPTY_ROOT_HASH},
     eip4844::{calc_blob_gasprice, calculate_excess_blob_gas},
-    keccak256,
-    proofs::{EMPTY_LIST_HASH, EMPTY_ROOT},
-    Address, BaseFeeParams, BlockBodyRoots, BlockHash, BlockNumHash, BlockNumber, Bloom, Bytes,
-    B256, B64, U256,
+    keccak256, Address, BaseFeeParams, BlockBodyRoots, BlockHash, BlockNumHash, BlockNumber, Bloom,
+    Bytes, B256, B64, U256,
 };
 use alloy_rlp::{length_of_length, Decodable, Encodable, EMPTY_LIST_CODE, EMPTY_STRING_CODE};
 use bytes::{Buf, BufMut, BytesMut};
@@ -14,28 +13,6 @@ use std::{
     mem,
     ops::{Deref, DerefMut},
 };
-
-/// Describes the current head block.
-///
-/// The head block is the highest fully synced block.
-///
-/// Note: This is a slimmed down version of [Header], primarily for communicating the highest block
-/// with the P2P network and the RPC.
-#[derive(
-    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
-)]
-pub struct Head {
-    /// The number of the head block.
-    pub number: BlockNumber,
-    /// The hash of the head block.
-    pub hash: B256,
-    /// The difficulty of the head block.
-    pub difficulty: U256,
-    /// The total difficulty at the head block.
-    pub total_difficulty: U256,
-    /// The timestamp of the head block.
-    pub timestamp: u64,
-}
 
 /// Block header
 #[main_codec]
@@ -116,11 +93,11 @@ impl Default for Header {
     fn default() -> Self {
         Header {
             parent_hash: Default::default(),
-            ommers_hash: EMPTY_LIST_HASH,
+            ommers_hash: EMPTY_OMMER_ROOT_HASH,
             beneficiary: Default::default(),
-            state_root: EMPTY_ROOT,
-            transactions_root: EMPTY_ROOT,
-            receipts_root: EMPTY_ROOT,
+            state_root: EMPTY_ROOT_HASH,
+            transactions_root: EMPTY_ROOT_HASH,
+            receipts_root: EMPTY_ROOT_HASH,
             logs_bloom: Default::default(),
             difficulty: Default::default(),
             number: 0,
@@ -157,7 +134,7 @@ impl Header {
     pub fn is_empty(&self) -> bool {
         let txs_and_ommers_empty = self.transaction_root_is_empty() && self.ommers_hash_is_empty();
         if let Some(withdrawals_root) = self.withdrawals_root {
-            txs_and_ommers_empty && withdrawals_root == EMPTY_ROOT
+            txs_and_ommers_empty && withdrawals_root == EMPTY_ROOT_HASH
         } else {
             txs_and_ommers_empty
         }
@@ -165,12 +142,12 @@ impl Header {
 
     /// Check if the ommers hash equals to empty hash list.
     pub fn ommers_hash_is_empty(&self) -> bool {
-        self.ommers_hash == EMPTY_LIST_HASH
+        self.ommers_hash == EMPTY_OMMER_ROOT_HASH
     }
 
     /// Check if the transaction root equals to empty root.
     pub fn transaction_root_is_empty(&self) -> bool {
-        self.transactions_root == EMPTY_ROOT
+        self.transactions_root == EMPTY_ROOT_HASH
     }
 
     /// Converts all roots in the header to a [BlockBodyRoots] struct.
@@ -220,11 +197,13 @@ impl Header {
     /// Seal the header with a known hash.
     ///
     /// WARNING: This method does not perform validation whether the hash is correct.
+    #[inline]
     pub fn seal(self, hash: B256) -> SealedHeader {
         SealedHeader { header: self, hash }
     }
 
     /// Calculate hash and seal the Header so that it can't be changed.
+    #[inline]
     pub fn seal_slow(self) -> SealedHeader {
         let hash = self.hash_slow();
         self.seal(hash)

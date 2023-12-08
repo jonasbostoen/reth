@@ -3,7 +3,7 @@ use crate::prefix_set::{PrefixSet, PrefixSetMut};
 use reth_db::{
     cursor::{DbCursorRO, DbDupCursorRO},
     tables,
-    transaction::{DbTx, DbTxGAT},
+    transaction::DbTx,
 };
 use reth_primitives::{trie::Nibbles, Account, StorageEntry, B256, U256};
 use std::collections::{HashMap, HashSet};
@@ -32,6 +32,19 @@ impl HashedStorage {
         }
     }
 
+    /// Returns `true` if the storage was wiped.
+    pub fn wiped(&self) -> bool {
+        self.wiped
+    }
+
+    /// Returns all storage slots.
+    pub fn storage_slots(&self) -> impl Iterator<Item = (B256, U256)> + '_ {
+        self.zero_valued_slots
+            .iter()
+            .map(|slot| (*slot, U256::ZERO))
+            .chain(self.non_zero_valued_storage.iter().cloned())
+    }
+
     /// Sorts the non zero value storage entries.
     pub fn sort_storage(&mut self) {
         if !self.sorted {
@@ -58,8 +71,8 @@ impl HashedStorage {
 pub struct HashedPostState {
     /// Map of hashed addresses to account info.
     accounts: Vec<(B256, Account)>,
-    /// Set of cleared accounts.
-    cleared_accounts: HashSet<B256>,
+    /// Set of destroyed accounts.
+    destroyed_accounts: HashSet<B256>,
     /// Map of hashed addresses to hashed storage.
     storages: HashMap<B256, HashedStorage>,
     /// Whether the account and storage entries were sorted or not.
@@ -70,7 +83,7 @@ impl Default for HashedPostState {
     fn default() -> Self {
         Self {
             accounts: Vec::new(),
-            cleared_accounts: HashSet::new(),
+            destroyed_accounts: HashSet::new(),
             storages: HashMap::new(),
             sorted: true, // empty is sorted
         }
@@ -82,6 +95,18 @@ impl HashedPostState {
     pub fn sorted(mut self) -> Self {
         self.sort();
         self
+    }
+
+    /// Returns all accounts with their state.
+    pub fn accounts(&self) -> impl Iterator<Item = (B256, Option<Account>)> + '_ {
+        self.destroyed_accounts.iter().map(|hashed_address| (*hashed_address, None)).chain(
+            self.accounts.iter().map(|(hashed_address, account)| (*hashed_address, Some(*account))),
+        )
+    }
+
+    /// Returns all account storages.
+    pub fn storages(&self) -> impl Iterator<Item = (&B256, &HashedStorage)> {
+        self.storages.iter()
     }
 
     /// Sort account and storage entries.
@@ -102,15 +127,20 @@ impl HashedPostState {
         self.sorted = false;
     }
 
-    /// Insert cleared hashed account key.
-    pub fn insert_cleared_account(&mut self, hashed_address: B256) {
-        self.cleared_accounts.insert(hashed_address);
+    /// Insert destroyed hashed account key.
+    pub fn insert_destroyed_account(&mut self, hashed_address: B256) {
+        self.destroyed_accounts.insert(hashed_address);
     }
 
     /// Insert hashed storage entry.
     pub fn insert_hashed_storage(&mut self, hashed_address: B256, hashed_storage: HashedStorage) {
         self.sorted &= hashed_storage.sorted;
         self.storages.insert(hashed_address, hashed_storage);
+    }
+
+    /// Returns all destroyed accounts.
+    pub fn destroyed_accounts(&self) -> HashSet<B256> {
+        self.destroyed_accounts.clone()
     }
 
     /// Construct (PrefixSet)[PrefixSet] from hashed post state.
@@ -125,7 +155,7 @@ impl HashedPostState {
         for (hashed_address, _) in &self.accounts {
             account_prefix_set.insert(Nibbles::unpack(hashed_address));
         }
-        for hashed_address in &self.cleared_accounts {
+        for hashed_address in &self.destroyed_accounts {
             account_prefix_set.insert(Nibbles::unpack(hashed_address));
         }
 
@@ -156,6 +186,12 @@ pub struct HashedPostStateCursorFactory<'a, 'b, TX> {
     post_state: &'b HashedPostState,
 }
 
+impl<'a, 'b, TX> Clone for HashedPostStateCursorFactory<'a, 'b, TX> {
+    fn clone(&self) -> Self {
+        Self { tx: self.tx, post_state: self.post_state }
+    }
+}
+
 impl<'a, 'b, TX> HashedPostStateCursorFactory<'a, 'b, TX> {
     /// Create a new factory.
     pub fn new(tx: &'a TX, post_state: &'b HashedPostState) -> Self {
@@ -163,20 +199,18 @@ impl<'a, 'b, TX> HashedPostStateCursorFactory<'a, 'b, TX> {
     }
 }
 
-impl<'a, 'b, 'tx, TX: DbTx<'tx>> HashedCursorFactory<'a>
-    for HashedPostStateCursorFactory<'a, 'b, TX>
-where
-    'a: 'b,
-{
-    type AccountCursor = HashedPostStateAccountCursor<'b, <TX as DbTxGAT<'a>>::Cursor<tables::HashedAccount>> where Self: 'a;
-    type StorageCursor = HashedPostStateStorageCursor<'b, <TX as DbTxGAT<'a>>::DupCursor<tables::HashedStorage>> where Self: 'a;
+impl<'a, 'b, TX: DbTx> HashedCursorFactory for HashedPostStateCursorFactory<'a, 'b, TX> {
+    type AccountCursor =
+        HashedPostStateAccountCursor<'b, <TX as DbTx>::Cursor<tables::HashedAccount>>;
+    type StorageCursor =
+        HashedPostStateStorageCursor<'b, <TX as DbTx>::DupCursor<tables::HashedStorage>>;
 
-    fn hashed_account_cursor(&'a self) -> Result<Self::AccountCursor, reth_db::DatabaseError> {
+    fn hashed_account_cursor(&self) -> Result<Self::AccountCursor, reth_db::DatabaseError> {
         let cursor = self.tx.cursor_read::<tables::HashedAccount>()?;
         Ok(HashedPostStateAccountCursor::new(cursor, self.post_state))
     }
 
-    fn hashed_storage_cursor(&'a self) -> Result<Self::StorageCursor, reth_db::DatabaseError> {
+    fn hashed_storage_cursor(&self) -> Result<Self::StorageCursor, reth_db::DatabaseError> {
         let cursor = self.tx.cursor_dup_read::<tables::HashedStorage>()?;
         Ok(HashedPostStateStorageCursor::new(cursor, self.post_state))
     }
@@ -209,7 +243,7 @@ impl<'b, C> HashedPostStateAccountCursor<'b, C> {
     /// This function only checks the post state, not the database, because the latter does not
     /// store destroyed accounts.
     fn is_account_cleared(&self, account: &B256) -> bool {
-        self.post_state.cleared_accounts.contains(account)
+        self.post_state.destroyed_accounts.contains(account)
     }
 
     /// Return the account with the lowest hashed account key.
@@ -242,9 +276,9 @@ impl<'b, C> HashedPostStateAccountCursor<'b, C> {
     }
 }
 
-impl<'b, 'tx, C> HashedAccountCursor for HashedPostStateAccountCursor<'b, C>
+impl<'b, C> HashedAccountCursor for HashedPostStateAccountCursor<'b, C>
 where
-    C: DbCursorRO<'tx, tables::HashedAccount>,
+    C: DbCursorRO<tables::HashedAccount>,
 {
     /// Seek the next entry for a given hashed account key.
     ///
@@ -404,9 +438,9 @@ impl<'b, C> HashedPostStateStorageCursor<'b, C> {
     }
 }
 
-impl<'b, 'tx, C> HashedStorageCursor for HashedPostStateStorageCursor<'b, C>
+impl<'b, C> HashedStorageCursor for HashedPostStateStorageCursor<'b, C>
 where
-    C: DbCursorRO<'tx, tables::HashedStorage> + DbDupCursorRO<'tx, tables::HashedStorage>,
+    C: DbCursorRO<tables::HashedStorage> + DbDupCursorRO<tables::HashedStorage>,
 {
     /// Returns `true` if the account has no storage entries.
     ///
@@ -544,12 +578,10 @@ mod tests {
     use reth_db::{database::Database, test_utils::create_test_rw_db, transaction::DbTxMut};
     use std::collections::BTreeMap;
 
-    fn assert_account_cursor_order<'a, 'b>(
-        factory: &'a impl HashedCursorFactory<'b>,
+    fn assert_account_cursor_order(
+        factory: &impl HashedCursorFactory,
         mut expected: impl Iterator<Item = (B256, Account)>,
-    ) where
-        'a: 'b,
-    {
+    ) {
         let mut cursor = factory.hashed_account_cursor().unwrap();
 
         let first_account = cursor.seek(B256::default()).unwrap();
@@ -563,12 +595,10 @@ mod tests {
         assert!(cursor.next().unwrap().is_none());
     }
 
-    fn assert_storage_cursor_order<'a, 'b>(
-        factory: &'a impl HashedCursorFactory<'b>,
+    fn assert_storage_cursor_order(
+        factory: &impl HashedCursorFactory,
         expected: impl Iterator<Item = (B256, BTreeMap<B256, U256>)>,
-    ) where
-        'a: 'b,
-    {
+    ) {
         let mut cursor = factory.hashed_storage_cursor().unwrap();
 
         for (account, storage) in expected {
@@ -667,7 +697,7 @@ mod tests {
         let mut hashed_post_state = HashedPostState::default();
         for (hashed_address, account) in accounts.iter().filter(|x| x.0[31] % 2 != 0) {
             if removed_keys.contains(hashed_address) {
-                hashed_post_state.insert_cleared_account(*hashed_address);
+                hashed_post_state.insert_destroyed_account(*hashed_address);
             } else {
                 hashed_post_state.insert_account(*hashed_address, *account);
             }
@@ -722,7 +752,7 @@ mod tests {
                     if let Some(account) = account {
                         hashed_post_state.insert_account(*hashed_address, *account);
                     } else {
-                        hashed_post_state.insert_cleared_account(*hashed_address);
+                        hashed_post_state.insert_destroyed_account(*hashed_address);
                     }
                 }
                 hashed_post_state.sort();
@@ -886,7 +916,7 @@ mod tests {
         let wiped = false;
         let mut hashed_storage = HashedStorage::new(wiped);
         for (slot, value) in post_state_storage.iter() {
-            if *value == U256::ZERO {
+            if value.is_zero() {
                 hashed_storage.insert_zero_valued_slot(*slot);
             } else {
                 hashed_storage.insert_non_zero_valued_storage(*slot, *value);
@@ -1000,7 +1030,7 @@ mod tests {
             for (address, (wiped, storage)) in &post_state_storages {
                 let mut hashed_storage = HashedStorage::new(*wiped);
                 for (slot, value) in storage {
-                    if *value == U256::ZERO {
+                    if value.is_zero() {
                         hashed_storage.insert_zero_valued_slot(*slot);
                     } else {
                         hashed_storage.insert_non_zero_valued_storage(*slot, *value);

@@ -15,9 +15,6 @@
 #![deny(unused_must_use, rust_2018_idioms)]
 #![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
 
-/// The Ethereum account as represented in the trie.
-pub mod account;
-
 /// The implementation of a container for storing intermediate changes to a trie.
 /// The container indicates when the trie has been modified.
 pub mod prefix_set;
@@ -33,6 +30,9 @@ pub mod walker;
 
 mod errors;
 pub use errors::*;
+
+// The iterators for traversing existing intermediate hashes and updated trie leaves.
+pub(crate) mod node_iter;
 
 /// Merkle proof generation.
 pub mod proof;

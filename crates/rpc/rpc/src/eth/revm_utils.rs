@@ -2,9 +2,9 @@
 
 use crate::eth::error::{EthApiError, EthResult, RpcInvalidTransactionError};
 use reth_primitives::{
-    AccessList, Address, Bytes, TransactionSigned, TransactionSignedEcRecovered, TxHash, B256, U256,
+    revm::env::{fill_tx_env, fill_tx_env_with_recovered},
+    Address, TransactionSigned, TransactionSignedEcRecovered, TxHash, B256, U256,
 };
-use reth_revm::env::{fill_tx_env, fill_tx_env_with_recovered};
 use reth_rpc_types::{
     state::{AccountOverride, StateOverride},
     BlockOverrides, CallRequest,
@@ -17,7 +17,7 @@ use revm::{
 };
 use revm_primitives::{
     db::{DatabaseCommit, DatabaseRef},
-    Bytecode, ExecutionResult,
+    Bytecode,
 };
 use tracing::trace;
 
@@ -74,7 +74,15 @@ impl FillableTransaction for TransactionSignedEcRecovered {
     }
 
     fn try_fill_tx_env(&self, tx_env: &mut TxEnv) -> EthResult<()> {
+        #[cfg(not(feature = "optimism"))]
         fill_tx_env_with_recovered(tx_env, self);
+
+        #[cfg(feature = "optimism")]
+        {
+            let mut envelope_buf = Vec::with_capacity(self.length_without_header());
+            self.encode_enveloped(&mut envelope_buf);
+            fill_tx_env_with_recovered(tx_env, self, envelope_buf.into());
+        }
         Ok(())
     }
 }
@@ -86,7 +94,15 @@ impl FillableTransaction for TransactionSigned {
     fn try_fill_tx_env(&self, tx_env: &mut TxEnv) -> EthResult<()> {
         let signer =
             self.recover_signer().ok_or_else(|| EthApiError::InvalidTransactionSignature)?;
+        #[cfg(not(feature = "optimism"))]
         fill_tx_env(tx_env, self, signer);
+
+        #[cfg(feature = "optimism")]
+        {
+            let mut envelope_buf = Vec::with_capacity(self.length_without_header());
+            self.encode_enveloped(&mut envelope_buf);
+            fill_tx_env(tx_env, self, signer, envelope_buf.into());
+        }
         Ok(())
     }
 }
@@ -309,10 +325,14 @@ pub(crate) fn create_txn_env(block_env: &BlockEnv, request: CallRequest) -> EthR
         value: value.unwrap_or_default(),
         data: input.try_into_unique_input()?.unwrap_or_default(),
         chain_id: chain_id.map(|c| c.to()),
-        access_list: access_list.map(AccessList::into_flattened).unwrap_or_default(),
+        access_list: access_list
+            .map(reth_rpc_types::AccessList::into_flattened)
+            .unwrap_or_default(),
         // EIP-4844 fields
         blob_hashes: blob_versioned_hashes.unwrap_or_default(),
         max_fee_per_blob_gas,
+        #[cfg(feature = "optimism")]
+        optimism: Default::default(),
     };
 
     Ok(env)
@@ -500,7 +520,10 @@ fn apply_block_overrides(overrides: BlockOverrides, env: &mut BlockEnv) {
 }
 
 /// Applies the given state overrides (a set of [AccountOverride]) to the [CacheDB].
-fn apply_state_overrides<DB>(overrides: StateOverride, db: &mut CacheDB<DB>) -> EthResult<()>
+pub(crate) fn apply_state_overrides<DB>(
+    overrides: StateOverride,
+    db: &mut CacheDB<DB>,
+) -> EthResult<()>
 where
     DB: DatabaseRef,
     EthApiError: From<<DB as DatabaseRef>::Error>,
@@ -522,8 +545,8 @@ where
     EthApiError: From<<DB as DatabaseRef>::Error>,
 {
     // we need to fetch the account via the `DatabaseRef` to not update the state of the account,
-    // which is modified via `Database::basic`
-    let mut account_info = DatabaseRef::basic(db, account)?.unwrap_or_default();
+    // which is modified via `Database::basic_ref`
+    let mut account_info = DatabaseRef::basic_ref(db, account)?.unwrap_or_default();
 
     if let Some(nonce) = account_override.nonce {
         account_info.nonce = nonce.to();
@@ -580,18 +603,6 @@ where
     }
 }
 
-/// Helper to get the output data from a result
-///
-/// TODO: Can be phased out when <https://github.com/bluealloy/revm/pull/509> is released
-#[inline]
-pub(crate) fn result_output(res: &ExecutionResult) -> Option<Bytes> {
-    match res {
-        ExecutionResult::Success { output, .. } => Some(output.clone().into_data()),
-        ExecutionResult::Revert { output, .. } => Some(output.clone()),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -601,7 +612,7 @@ mod tests {
         let CallFees { gas_price, .. } =
             CallFees::ensure_fees(None, None, None, U256::from(99), None, None, Some(U256::ZERO))
                 .unwrap();
-        assert_eq!(gas_price, U256::ZERO);
+        assert!(gas_price.is_zero());
     }
 
     #[test]
@@ -609,7 +620,7 @@ mod tests {
         let CallFees { gas_price, max_fee_per_blob_gas, .. } =
             CallFees::ensure_fees(None, None, None, U256::from(99), None, None, Some(U256::ZERO))
                 .unwrap();
-        assert_eq!(gas_price, U256::ZERO);
+        assert!(gas_price.is_zero());
         assert_eq!(max_fee_per_blob_gas, None);
 
         let CallFees { gas_price, max_fee_per_blob_gas, .. } = CallFees::ensure_fees(
@@ -622,7 +633,7 @@ mod tests {
             Some(U256::from(99)),
         )
         .unwrap();
-        assert_eq!(gas_price, U256::ZERO);
+        assert!(gas_price.is_zero());
         assert_eq!(max_fee_per_blob_gas, Some(U256::from(99)));
     }
 }

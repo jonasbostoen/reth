@@ -20,11 +20,17 @@ mod disconnect;
 pub mod errors;
 mod ethstream;
 mod hello;
+pub mod multiplex;
+pub mod muxdemux;
 mod p2pstream;
 mod pinger;
+pub mod protocol;
 pub use builder::*;
 pub mod types;
 pub use types::*;
+
+#[cfg(test)]
+pub mod test_utils;
 
 #[cfg(test)]
 pub use tokio_util::codec::{
@@ -32,8 +38,14 @@ pub use tokio_util::codec::{
 };
 
 pub use crate::{
+    capability::Capability,
     disconnect::{CanDisconnect, DisconnectReason},
     ethstream::{EthStream, UnauthedEthStream, MAX_MESSAGE_SIZE},
-    hello::HelloMessage,
-    p2pstream::{P2PMessage, P2PMessageID, P2PStream, ProtocolVersion, UnauthedP2PStream},
+    hello::{HelloMessage, HelloMessageBuilder, HelloMessageWithProtocols},
+    muxdemux::{MuxDemuxStream, StreamClone},
+    p2pstream::{
+        DisconnectP2P, P2PMessage, P2PMessageID, P2PStream, ProtocolVersion, UnauthedP2PStream,
+        MAX_RESERVED_MESSAGE_ID,
+    },
+    types::EthVersion,
 };
