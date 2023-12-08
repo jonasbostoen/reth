@@ -818,7 +818,7 @@ pub struct ConnectionInfo {
 impl ConnectionInfo {
     ///  Returns `true` if there's still capacity for a new outgoing connection.
     fn has_out_capacity(&self) -> bool {
-        debug!(target: "patch", current = self.num_outbound, max = self.max_outbound, "has_out_capacity");
+        tracing::debug!(target: "patch", current = self.num_outbound, max = self.max_outbound, "has_out_capacity");
         self.num_outbound < self.max_outbound
     }
 
