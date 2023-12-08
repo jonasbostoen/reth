@@ -686,7 +686,6 @@ impl PeersManager {
     /// New connections are only initiated, if slots are available and appropriate peers are
     /// available.
     fn fill_outbound_slots(&mut self) {
-        let peer_len = self.peers.len();
         self.tick();
 
         // as long as there a slots available try to fill them with the best peers
