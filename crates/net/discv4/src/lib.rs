@@ -21,8 +21,6 @@
     html_favicon_url = "https://avatars0.githubusercontent.com/u/97369466?s=256",
     issue_tracker_base_url = "https://github.com/paradigmxyz/reth/issues/"
 )]
-#![warn(missing_debug_implementations, missing_docs, rustdoc::all)]
-#![deny(unused_must_use, rust_2018_idioms, unreachable_pub, unused_crate_dependencies)]
 #![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
 
 use crate::{
@@ -64,7 +62,7 @@ use tokio::{
     time::Interval,
 };
 use tokio_stream::{wrappers::ReceiverStream, Stream, StreamExt};
-use tracing::{debug, trace, warn};
+use tracing::{debug, trace};
 
 pub mod error;
 pub mod proto;
@@ -1607,7 +1605,9 @@ impl Discv4Service {
             // process all incoming datagrams
             while let Poll::Ready(Some(event)) = self.ingress.poll_recv(cx) {
                 match event {
-                    IngressEvent::RecvError(_) => {}
+                    IngressEvent::RecvError(err) => {
+                        debug!(target: "discv4", %err, "failed to read datagram");
+                    }
                     IngressEvent::BadPacket(from, err, data) => {
                         debug!(target: "discv4", ?from, ?err, packet=?hex::encode(&data),   "bad packet");
                     }

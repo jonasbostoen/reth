@@ -2,6 +2,7 @@
 //!
 //! A [`Chain`] contains the state of accounts for the chain after execution of its constituent
 //! blocks, as well as a list of the blocks the chain is composed of.
+
 use super::externals::TreeExternals;
 use crate::BundleStateDataRef;
 use reth_db::database::Database;
@@ -171,7 +172,15 @@ impl AppendableChain {
             externals,
         )
         .map_err(|err| InsertBlockError::new(block.block.clone(), err.into()))?;
+        // extending will also optimize few things, mostly related to selfdestruct and wiping of
+        // storage.
         state.extend(block_state);
+
+        // remove all receipts and reverts (except the last one), as they belong to the chain we
+        // forked from and not the new chain we are creating.
+        let size = state.receipts().len();
+        state.receipts_mut().drain(0..size - 1);
+        state.state_mut().take_n_reverts(size - 1);
 
         // If all is okay, return new chain back. Present chain is not modified.
         Ok(Self { chain: Chain::from_block(block, state) })
@@ -202,9 +211,6 @@ impl AppendableChain {
         // some checks are done before blocks comes here.
         externals.consensus.validate_header_against_parent(&block, parent_block)?;
 
-        let (block, senders) = block.into_components();
-        let block = block.unseal();
-
         // get the state provider.
         let canonical_fork = bundle_state_data_provider.canonical_fork();
         let state_provider =
@@ -213,7 +219,8 @@ impl AppendableChain {
         let provider = BundleStateProvider::new(state_provider, bundle_state_data_provider);
 
         let mut executor = externals.executor_factory.with_state(&provider);
-        executor.execute_and_verify_receipt(&block, U256::MAX, Some(senders))?;
+        let block = block.unseal();
+        executor.execute_and_verify_receipt(&block, U256::MAX)?;
         let bundle_state = executor.take_output_state();
 
         // check state root if the block extends the canonical chain __and__ if state root
