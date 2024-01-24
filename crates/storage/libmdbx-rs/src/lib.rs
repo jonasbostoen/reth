@@ -12,7 +12,8 @@ pub use crate::{
     cursor::{Cursor, Iter, IterDup},
     database::Database,
     environment::{
-        Environment, EnvironmentBuilder, EnvironmentKind, Geometry, Info, PageSize, Stat,
+        Environment, EnvironmentBuilder, EnvironmentKind, Geometry, HandleSlowReadersCallback,
+        HandleSlowReadersReturnCode, Info, PageSize, Stat,
     },
     error::{Error, Result},
     flags::*,
@@ -22,6 +23,9 @@ pub mod ffi {
     pub use ffi::{MDBX_dbi as DBI, MDBX_log_level_t as LogLevel};
 }
 
+#[cfg(feature = "read-tx-timeouts")]
+pub use crate::environment::read_transactions::MaxReadTransactionDuration;
+
 mod codec;
 mod cursor;
 mod database;
@@ -29,6 +33,7 @@ mod environment;
 mod error;
 mod flags;
 mod transaction;
+mod txn_manager;
 
 #[cfg(test)]
 mod test_utils {

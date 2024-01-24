@@ -10,7 +10,7 @@ use crate::{
     TransactionsProvider, WithdrawalsProvider,
 };
 use reth_db::{database::Database, init_db, models::StoredBlockBodyIndices, DatabaseEnv};
-use reth_interfaces::{db::LogLevel, provider::ProviderResult, RethError, RethResult};
+use reth_interfaces::{provider::ProviderResult, RethError, RethResult};
 use reth_primitives::{
     snapshot::HighestSnapshots,
     stage::{StageCheckpoint, StageId},
@@ -32,6 +32,7 @@ mod metrics;
 mod provider;
 
 pub use provider::{DatabaseProvider, DatabaseProviderRO, DatabaseProviderRW};
+use reth_db::mdbx::DatabaseArguments;
 
 /// A common provider that fetches data from a database.
 ///
@@ -56,8 +57,6 @@ impl<DB: Clone> Clone for ProviderFactory<DB> {
     }
 }
 
-impl<DB: Database> ProviderFactory<DB> {}
-
 impl<DB> ProviderFactory<DB> {
     /// Create new database provider factory.
     pub fn new(db: DB, chain_spec: Arc<ChainSpec>) -> Self {
@@ -69,10 +68,10 @@ impl<DB> ProviderFactory<DB> {
     pub fn new_with_database_path<P: AsRef<Path>>(
         path: P,
         chain_spec: Arc<ChainSpec>,
-        log_level: Option<LogLevel>,
+        args: DatabaseArguments,
     ) -> RethResult<ProviderFactory<DatabaseEnv>> {
         Ok(ProviderFactory::<DatabaseEnv> {
-            db: init_db(path, log_level).map_err(|e| RethError::Custom(e.to_string()))?,
+            db: init_db(path, args).map_err(|e| RethError::Custom(e.to_string()))?,
             chain_spec,
             snapshot_provider: None,
         })
@@ -101,6 +100,7 @@ impl<DB: Database> ProviderFactory<DB> {
     /// Returns a provider with a created `DbTx` inside, which allows fetching data from the
     /// database using different types of providers. Example: [`HeaderProvider`]
     /// [`BlockHashReader`]. This may fail if the inner read database transaction fails to open.
+    #[track_caller]
     pub fn provider(&self) -> ProviderResult<DatabaseProviderRO<DB>> {
         let mut provider = DatabaseProvider::new(self.db.tx()?, self.chain_spec.clone());
 
@@ -115,6 +115,7 @@ impl<DB: Database> ProviderFactory<DB> {
     /// data from the database using different types of providers. Example: [`HeaderProvider`]
     /// [`BlockHashReader`].  This may fail if the inner read/write database transaction fails to
     /// open.
+    #[track_caller]
     pub fn provider_rw(&self) -> ProviderResult<DatabaseProviderRW<DB>> {
         let mut provider = DatabaseProvider::new_rw(self.db.tx_mut()?, self.chain_spec.clone());
 
@@ -126,6 +127,7 @@ impl<DB: Database> ProviderFactory<DB> {
     }
 
     /// Storage provider for latest block
+    #[track_caller]
     pub fn latest(&self) -> ProviderResult<StateProviderBox> {
         trace!(target: "providers::db", "Returning latest state provider");
         Ok(Box::new(LatestStateProvider::new(self.db.tx()?)))
@@ -141,7 +143,7 @@ impl<DB: Database> ProviderFactory<DB> {
         if block_number == provider.best_block_number().unwrap_or_default() &&
             block_number == provider.last_block_number().unwrap_or_default()
         {
-            return Ok(Box::new(LatestStateProvider::new(provider.into_tx())));
+            return Ok(Box::new(LatestStateProvider::new(provider.into_tx())))
         }
 
         // +1 as the changeset that we want is the one that was applied after this block.
@@ -553,7 +555,7 @@ mod tests {
         let factory = ProviderFactory::<DatabaseEnv>::new_with_database_path(
             tempfile::TempDir::new().expect(ERROR_TEMPDIR).into_path(),
             Arc::new(chain_spec),
-            None,
+            Default::default(),
         )
         .unwrap();
 

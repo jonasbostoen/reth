@@ -1,4 +1,5 @@
 //! Support for customizing the node
+
 use super::cli::{components::RethRpcServerHandles, ext::DefaultRethNodeCommandConfig};
 use crate::{
     args::{
@@ -11,7 +12,10 @@ use crate::{
         db_type::{DatabaseBuilder, DatabaseInstance},
         ext::{RethCliExt, RethNodeCommandConfig},
     },
-    commands::node::{cl_events::ConsensusLayerHealthEvents, events},
+    commands::{
+        debug_cmd::EngineApiStore,
+        node::{cl_events::ConsensusLayerHealthEvents, events},
+    },
     dirs::{ChainPath, DataDirPath, MaybePlatformPath},
     init::init_genesis,
     prometheus_exporter,
@@ -56,6 +60,12 @@ use reth_interfaces::{
 };
 use reth_network::{NetworkBuilder, NetworkConfig, NetworkEvents, NetworkHandle, NetworkManager};
 use reth_network_api::{NetworkInfo, PeersInfo};
+#[cfg(not(feature = "optimism"))]
+use reth_node_builder::EthEngineTypes;
+#[cfg(feature = "optimism")]
+use reth_node_builder::OptimismEngineTypes;
+
+use reth_payload_builder::PayloadBuilderHandle;
 use reth_primitives::{
     constants::eip4844::{LoadKzgSettingsError, MAINNET_KZG_TRUSTED_SETUP},
     kzg::KzgSettings,
@@ -70,7 +80,6 @@ use reth_provider::{
 };
 use reth_prune::PrunerBuilder;
 use reth_revm::EvmProcessorFactory;
-use reth_revm_inspectors::stack::Hook;
 use reth_rpc_engine_api::EngineApi;
 use reth_stages::{
     prelude::*,
@@ -83,21 +92,19 @@ use reth_stages::{
 };
 use reth_tasks::{TaskExecutor, TaskManager};
 use reth_transaction_pool::{
-    blobstore::InMemoryBlobStore, EthTransactionPool, TransactionPool,
+    blobstore::DiskFileBlobStore, EthTransactionPool, TransactionPool,
     TransactionValidationTaskExecutor,
 };
+use revm_inspectors::stack::Hook;
 use secp256k1::SecretKey;
 use std::{
     net::{SocketAddr, SocketAddrV4},
     path::PathBuf,
     sync::Arc,
 };
-use tokio::{
-    runtime::Handle,
-    sync::{
-        mpsc::{unbounded_channel, Receiver, UnboundedSender},
-        oneshot, watch,
-    },
+use tokio::sync::{
+    mpsc::{unbounded_channel, Receiver, UnboundedSender},
+    oneshot, watch,
 };
 use tracing::*;
 
@@ -241,7 +248,7 @@ pub struct NodeConfig {
 impl NodeConfig {
     /// Creates a testing [NodeConfig], causing the database to be launched ephemerally.
     pub fn test() -> Self {
-        Self {
+        let mut test = Self {
             database: DatabaseBuilder::test(),
             config: None,
             chain: MAINNET.clone(),
@@ -258,7 +265,11 @@ impl NodeConfig {
             pruning: PruningArgs::default(),
             #[cfg(feature = "optimism")]
             rollup: crate::args::RollupArgs::default(),
-        }
+        };
+
+        // set all ports to zero by default for test instances
+        test = test.with_unused_ports();
+        test
     }
 
     /// Set the datadir for the node
@@ -273,9 +284,9 @@ impl NodeConfig {
         self
     }
 
-    /// Set the chain for the node
-    pub fn with_chain(mut self, chain: Arc<ChainSpec>) -> Self {
-        self.chain = chain;
+    /// Set the [ChainSpec] for the node
+    pub fn with_chain(mut self, chain: impl Into<Arc<ChainSpec>>) -> Self {
+        self.chain = chain.into();
         self
     }
 
@@ -288,12 +299,6 @@ impl NodeConfig {
     /// Set the instance for the node
     pub fn with_instance(mut self, instance: u16) -> Self {
         self.instance = instance;
-        self
-    }
-
-    /// Set the [ChainSpec] for the node
-    pub fn with_chain_spec(mut self, chain: Arc<ChainSpec>) -> Self {
-        self.chain = chain;
         self
     }
 
@@ -348,12 +353,6 @@ impl NodeConfig {
     /// Set the pruning args for the node
     pub fn with_pruning(mut self, pruning: PruningArgs) -> Self {
         self.pruning = pruning;
-        self
-    }
-
-    /// Set the node instance number
-    pub fn with_instance_number(mut self, instance: u16) -> Self {
-        self.instance = instance;
         self
     }
 
@@ -534,7 +533,7 @@ impl NodeConfig {
         head: Head,
         executor: &TaskExecutor,
         data_dir: &ChainPath<DataDirPath>,
-    ) -> eyre::Result<EthTransactionPool<BlockchainProvider<DB, Tree>, InMemoryBlobStore>>
+    ) -> eyre::Result<EthTransactionPool<BlockchainProvider<DB, Tree>, DiskFileBlobStore>>
     where
         DB: Database + Unpin + Clone + 'static,
         Tree: BlockchainTreeEngine
@@ -543,7 +542,7 @@ impl NodeConfig {
             + Clone
             + 'static,
     {
-        let blob_store = InMemoryBlobStore::default();
+        let blob_store = DiskFileBlobStore::open(data_dir.blobstore_path(), Default::default())?;
         let validator = TransactionValidationTaskExecutor::eth_builder(Arc::clone(&self.chain))
             .with_head_timestamp(head.timestamp)
             .kzg_settings(self.kzg_settings()?)
@@ -859,7 +858,7 @@ impl NodeConfig {
         }
 
         let (tip_tx, tip_rx) = watch::channel(B256::ZERO);
-        use reth_revm_inspectors::stack::InspectorStackConfig;
+        use revm_inspectors::stack::InspectorStackConfig;
         let factory = reth_revm::EvmProcessorFactory::new(self.chain.clone());
 
         let stack_config = InspectorStackConfig {
@@ -907,6 +906,7 @@ impl NodeConfig {
                             max_blocks: stage_config.execution.max_blocks,
                             max_changes: stage_config.execution.max_changes,
                             max_cumulative_gas: stage_config.execution.max_cumulative_gas,
+                            max_duration: stage_config.execution.max_duration,
                         },
                         stage_config
                             .merkle
@@ -949,6 +949,14 @@ impl NodeConfig {
     fn adjust_instance_ports(&mut self) {
         self.rpc.adjust_instance_ports(self.instance);
     }
+
+    /// Sets networking and RPC ports to zero, causing the OS to choose random unused ports when
+    /// sockets are bound.
+    fn with_unused_ports(mut self) -> Self {
+        self.rpc = self.rpc.with_unused_ports();
+        self.network = self.network.with_unused_ports();
+        self
+    }
 }
 
 impl Default for NodeConfig {
@@ -978,6 +986,7 @@ impl Default for NodeConfig {
 /// [NodeHandle].
 ///
 /// This also contains a path to a data dir that cannot be changed.
+#[derive(Debug)]
 pub struct NodeBuilderWithDatabase<DB> {
     /// The node config
     pub config: NodeConfig,
@@ -1079,13 +1088,13 @@ impl<DB: Database + DatabaseMetrics + DatabaseMetadata + 'static> NodeBuilderWit
             )
             .await?;
 
-        let components = RethNodeComponentsImpl {
-            provider: blockchain_db.clone(),
-            pool: transaction_pool.clone(),
-            network: network_builder.handle(),
-            task_executor: executor.clone(),
-            events: blockchain_db.clone(),
-        };
+        let components = RethNodeComponentsImpl::new(
+            blockchain_db.clone(),
+            transaction_pool.clone(),
+            network_builder.handle(),
+            executor.clone(),
+            blockchain_db.clone(),
+        );
 
         // allow network modifications
         ext.configure_network(network_builder.network_mut(), &components)?;
@@ -1106,10 +1115,35 @@ impl<DB: Database + DatabaseMetrics + DatabaseMetadata + 'static> NodeBuilderWit
         ext.on_components_initialized(&components)?;
 
         debug!(target: "reth::cli", "Spawning payload builder service");
-        let payload_builder =
-            ext.spawn_payload_builder_service(&self.config.builder, &components)?;
 
-        let (consensus_engine_tx, consensus_engine_rx) = unbounded_channel();
+        // TODO: stateful node builder should handle this in with_payload_builder
+        // Optimism's payload builder is implemented on the OptimismPayloadBuilder type.
+        #[cfg(feature = "optimism")]
+        let payload_builder = reth_optimism_payload_builder::OptimismPayloadBuilder::default()
+            .set_compute_pending_block(self.config.builder.compute_pending_block);
+
+        #[cfg(feature = "optimism")]
+        let payload_builder: PayloadBuilderHandle<OptimismEngineTypes> =
+            ext.spawn_payload_builder_service(&self.config.builder, &components, payload_builder)?;
+
+        // The default payload builder is implemented on the unit type.
+        #[cfg(not(feature = "optimism"))]
+        let payload_builder = reth_ethereum_payload_builder::EthereumPayloadBuilder::default();
+
+        #[cfg(not(feature = "optimism"))]
+        let payload_builder: PayloadBuilderHandle<EthEngineTypes> =
+            ext.spawn_payload_builder_service(&self.config.builder, &components, payload_builder)?;
+
+        let (consensus_engine_tx, mut consensus_engine_rx) = unbounded_channel();
+        if let Some(store_path) = self.config.debug.engine_api_store.clone() {
+            let (engine_intercept_tx, engine_intercept_rx) = unbounded_channel();
+            let engine_api_store = EngineApiStore::new(store_path);
+            executor.spawn_critical(
+                "engine api interceptor",
+                engine_api_store.intercept(consensus_engine_rx, engine_intercept_tx),
+            );
+            consensus_engine_rx = engine_intercept_rx;
+        };
         let max_block = self.config.max_block(&network_client, provider_factory.clone()).await?;
 
         // Configure the pipeline
@@ -1267,7 +1301,7 @@ impl<DB: Database + DatabaseMetrics + DatabaseMetadata + 'static> NodeBuilderWit
         #[cfg(feature = "optimism")]
         if self.config.chain.is_optimism() && !self.config.rollup.enable_genesis_walkback {
             let client = rpc_server_handles.auth.http_client();
-            reth_rpc_api::EngineApiClient::fork_choice_updated_v2(
+            reth_rpc_api::EngineApiClient::<OptimismEngineTypes>::fork_choice_updated_v2(
                 &client,
                 reth_rpc_types::engine::ForkchoiceState {
                     head_block_hash: head.hash,
@@ -1340,7 +1374,6 @@ impl NodeHandle {
     /// Waits for the node to exit, if it was configured to exit.
     pub async fn wait_for_node_exit(self) -> eyre::Result<()> {
         self.consensus_engine_rx.await??;
-        info!(target: "reth::cli", "Consensus engine has exited.");
 
         if self.terminate {
             Ok(())
@@ -1353,7 +1386,7 @@ impl NodeHandle {
 }
 
 /// A simple function to launch a node with the specified [NodeConfig], spawning tasks on the
-/// [TaskExecutor] constructed from [Handle::current].
+/// [TaskExecutor] constructed from [TaskManager::current].
 ///
 /// # Example
 /// ```
@@ -1365,18 +1398,17 @@ impl NodeHandle {
 ///     // Create a node builder with an http rpc server enabled
 ///     let rpc_args = RpcServerArgs::default().with_http();
 ///
-///     /// Set the node instance number to 2
-///     let builder = NodeConfig::test().with_rpc(rpc_args).with_instance(2);
+///     let builder = NodeConfig::test().with_rpc(rpc_args);
 ///
 ///     // Spawn the builder, returning a handle to the node
-///     let _handle = spawn_node(builder).await.unwrap();
+///     let (_handle, _manager) = spawn_node(builder).await.unwrap();
 /// }
 /// ```
-pub async fn spawn_node(config: NodeConfig) -> eyre::Result<NodeHandle> {
-    let handle = Handle::current();
-    let task_manager = TaskManager::new(handle);
-    let ext = DefaultRethNodeCommandConfig;
-    config.launch::<()>(ext, task_manager.executor()).await
+
+pub async fn spawn_node(config: NodeConfig) -> eyre::Result<(NodeHandle, TaskManager)> {
+    let task_manager = TaskManager::current();
+    let ext = DefaultRethNodeCommandConfig::default();
+    Ok((config.launch::<()>(ext, task_manager.executor()).await?, task_manager))
 }
 
 #[cfg(test)]
@@ -1390,11 +1422,7 @@ mod tests {
         // this launches a test node with http
         let rpc_args = RpcServerArgs::default().with_http();
 
-        // NOTE: tests here manually set an instance number. The alternative would be to use an
-        // atomic counter. This works for `cargo test` but if tests would be run in `nextest` then
-        // they would become flaky. So new tests should manually set a unique instance number.
-        let handle =
-            spawn_node(NodeConfig::test().with_rpc(rpc_args).with_instance(1)).await.unwrap();
+        let (handle, _manager) = spawn_node(NodeConfig::test().with_rpc(rpc_args)).await.unwrap();
 
         // call a function on the node
         let client = handle.rpc_server_handles().rpc.http_client().unwrap();
@@ -1407,7 +1435,7 @@ mod tests {
     #[tokio::test]
     async fn rpc_handles_none_without_http() {
         // this launches a test node _without_ http
-        let handle = spawn_node(NodeConfig::test().with_instance(2)).await.unwrap();
+        let (handle, _manager) = spawn_node(NodeConfig::test()).await.unwrap();
 
         // ensure that the `http_client` is none
         let maybe_client = handle.rpc_server_handles().rpc.http_client();
@@ -1419,12 +1447,283 @@ mod tests {
         // spawn_test_node takes roughly 1 second per node, so this test takes ~4 seconds
         let num_nodes = 4;
 
-        let starting_instance = 3;
+        // contains handles and managers
         let mut handles = Vec::new();
-        for i in 0..num_nodes {
-            let handle =
-                spawn_node(NodeConfig::test().with_instance(starting_instance + i)).await.unwrap();
+        for _ in 0..num_nodes {
+            let handle = spawn_node(NodeConfig::test()).await.unwrap();
             handles.push(handle);
         }
+    }
+
+    #[cfg(feature = "optimism")]
+    #[tokio::test]
+    async fn optimism_pre_canyon_no_withdrawals_valid() {
+        reth_tracing::init_test_tracing();
+        use alloy_chains::Chain;
+        use jsonrpsee::http_client::HttpClient;
+        use reth_primitives::Genesis;
+        use reth_rpc_api::EngineApiClient;
+        use reth_rpc_types::engine::{
+            ForkchoiceState, OptimismPayloadAttributes, PayloadAttributes,
+        };
+
+        // this launches a test node with http
+        let rpc_args = RpcServerArgs::default().with_http();
+
+        // create optimism genesis with canyon at block 2
+        let spec = ChainSpec::builder()
+            .chain(Chain::optimism_mainnet())
+            .genesis(Genesis::default())
+            .regolith_activated()
+            .build();
+
+        let genesis_hash = spec.genesis_hash();
+
+        // create node config
+        let node_config = NodeConfig::test().with_rpc(rpc_args).with_chain(spec);
+
+        let (handle, _manager) = spawn_node(node_config).await.unwrap();
+
+        // call a function on the node
+        let client = handle.rpc_server_handles().auth.http_client();
+        let block_number = client.block_number().await.unwrap();
+
+        // it should be zero, since this is an ephemeral test node
+        assert_eq!(block_number, U256::ZERO);
+
+        // call the engine_forkchoiceUpdated function with payload attributes
+        let forkchoice_state = ForkchoiceState {
+            head_block_hash: genesis_hash,
+            safe_block_hash: genesis_hash,
+            finalized_block_hash: genesis_hash,
+        };
+
+        let payload_attributes = OptimismPayloadAttributes {
+            payload_attributes: PayloadAttributes {
+                timestamp: 1,
+                prev_randao: Default::default(),
+                suggested_fee_recipient: Default::default(),
+                // canyon is _not_ in the chain spec, so this should cause the engine call to fail
+                withdrawals: None,
+                parent_beacon_block_root: None,
+            },
+            no_tx_pool: None,
+            gas_limit: Some(1),
+            transactions: None,
+        };
+
+        // call the engine_forkchoiceUpdated function with payload attributes
+        let res = <HttpClient as EngineApiClient<OptimismEngineTypes>>::fork_choice_updated_v2(
+            &client,
+            forkchoice_state,
+            Some(payload_attributes),
+        )
+        .await;
+        res.expect("pre-canyon engine call without withdrawals should succeed");
+    }
+
+    #[cfg(feature = "optimism")]
+    #[tokio::test]
+    async fn optimism_pre_canyon_withdrawals_invalid() {
+        reth_tracing::init_test_tracing();
+        use alloy_chains::Chain;
+        use assert_matches::assert_matches;
+        use jsonrpsee::{core::Error, http_client::HttpClient, types::error::INVALID_PARAMS_CODE};
+        use reth_primitives::Genesis;
+        use reth_rpc_api::EngineApiClient;
+        use reth_rpc_types::engine::{
+            ForkchoiceState, OptimismPayloadAttributes, PayloadAttributes,
+        };
+
+        // this launches a test node with http
+        let rpc_args = RpcServerArgs::default().with_http();
+
+        // create optimism genesis with canyon at block 2
+        let spec = ChainSpec::builder()
+            .chain(Chain::optimism_mainnet())
+            .genesis(Genesis::default())
+            .regolith_activated()
+            .build();
+
+        let genesis_hash = spec.genesis_hash();
+
+        // create node config
+        let node_config = NodeConfig::test().with_rpc(rpc_args).with_chain(spec);
+
+        let (handle, _manager) = spawn_node(node_config).await.unwrap();
+
+        // call a function on the node
+        let client = handle.rpc_server_handles().auth.http_client();
+        let block_number = client.block_number().await.unwrap();
+
+        // it should be zero, since this is an ephemeral test node
+        assert_eq!(block_number, U256::ZERO);
+
+        // call the engine_forkchoiceUpdated function with payload attributes
+        let forkchoice_state = ForkchoiceState {
+            head_block_hash: genesis_hash,
+            safe_block_hash: genesis_hash,
+            finalized_block_hash: genesis_hash,
+        };
+
+        let payload_attributes = OptimismPayloadAttributes {
+            payload_attributes: PayloadAttributes {
+                timestamp: 1,
+                prev_randao: Default::default(),
+                suggested_fee_recipient: Default::default(),
+                // canyon is _not_ in the chain spec, so this should cause the engine call to fail
+                withdrawals: Some(vec![]),
+                parent_beacon_block_root: None,
+            },
+            no_tx_pool: None,
+            gas_limit: Some(1),
+            transactions: None,
+        };
+
+        // call the engine_forkchoiceUpdated function with payload attributes
+        let res = <HttpClient as EngineApiClient<OptimismEngineTypes>>::fork_choice_updated_v2(
+            &client,
+            forkchoice_state,
+            Some(payload_attributes),
+        )
+        .await;
+        let err = res.expect_err("pre-canyon engine call with withdrawals should fail");
+        assert_matches!(err, Error::Call(ref object) if object.code() == INVALID_PARAMS_CODE);
+    }
+
+    #[cfg(feature = "optimism")]
+    #[tokio::test]
+    async fn optimism_post_canyon_no_withdrawals_invalid() {
+        reth_tracing::init_test_tracing();
+        use alloy_chains::Chain;
+        use assert_matches::assert_matches;
+        use jsonrpsee::{core::Error, http_client::HttpClient, types::error::INVALID_PARAMS_CODE};
+        use reth_primitives::Genesis;
+        use reth_rpc_api::EngineApiClient;
+        use reth_rpc_types::engine::{
+            ForkchoiceState, OptimismPayloadAttributes, PayloadAttributes,
+        };
+
+        // this launches a test node with http
+        let rpc_args = RpcServerArgs::default().with_http();
+
+        // create optimism genesis with canyon at block 2
+        let spec = ChainSpec::builder()
+            .chain(Chain::optimism_mainnet())
+            .genesis(Genesis::default())
+            .canyon_activated()
+            .build();
+
+        let genesis_hash = spec.genesis_hash();
+
+        // create node config
+        let node_config = NodeConfig::test().with_rpc(rpc_args).with_chain(spec);
+
+        let (handle, _manager) = spawn_node(node_config).await.unwrap();
+
+        // call a function on the node
+        let client = handle.rpc_server_handles().auth.http_client();
+        let block_number = client.block_number().await.unwrap();
+
+        // it should be zero, since this is an ephemeral test node
+        assert_eq!(block_number, U256::ZERO);
+
+        // call the engine_forkchoiceUpdated function with payload attributes
+        let forkchoice_state = ForkchoiceState {
+            head_block_hash: genesis_hash,
+            safe_block_hash: genesis_hash,
+            finalized_block_hash: genesis_hash,
+        };
+
+        let payload_attributes = OptimismPayloadAttributes {
+            payload_attributes: PayloadAttributes {
+                timestamp: 1,
+                prev_randao: Default::default(),
+                suggested_fee_recipient: Default::default(),
+                // canyon is _not_ in the chain spec, so this should cause the engine call to fail
+                withdrawals: None,
+                parent_beacon_block_root: None,
+            },
+            no_tx_pool: None,
+            gas_limit: Some(1),
+            transactions: None,
+        };
+
+        // call the engine_forkchoiceUpdated function with payload attributes
+        let res = <HttpClient as EngineApiClient<OptimismEngineTypes>>::fork_choice_updated_v2(
+            &client,
+            forkchoice_state,
+            Some(payload_attributes),
+        )
+        .await;
+        let err = res.expect_err("post-canyon engine call with no withdrawals should fail");
+        assert_matches!(err, Error::Call(ref object) if object.code() == INVALID_PARAMS_CODE);
+    }
+
+    #[cfg(feature = "optimism")]
+    #[tokio::test]
+    async fn optimism_post_canyon_withdrawals_valid() {
+        reth_tracing::init_test_tracing();
+        use alloy_chains::Chain;
+        use jsonrpsee::http_client::HttpClient;
+        use reth_primitives::Genesis;
+        use reth_rpc_api::EngineApiClient;
+        use reth_rpc_types::engine::{
+            ForkchoiceState, OptimismPayloadAttributes, PayloadAttributes,
+        };
+
+        // this launches a test node with http
+        let rpc_args = RpcServerArgs::default().with_http();
+
+        // create optimism genesis with canyon at block 2
+        let spec = ChainSpec::builder()
+            .chain(Chain::optimism_mainnet())
+            .genesis(Genesis::default())
+            .canyon_activated()
+            .build();
+
+        let genesis_hash = spec.genesis_hash();
+
+        // create node config
+        let node_config = NodeConfig::test().with_rpc(rpc_args).with_chain(spec);
+
+        let (handle, _manager) = spawn_node(node_config).await.unwrap();
+
+        // call a function on the node
+        let client = handle.rpc_server_handles().auth.http_client();
+        let block_number = client.block_number().await.unwrap();
+
+        // it should be zero, since this is an ephemeral test node
+        assert_eq!(block_number, U256::ZERO);
+
+        // call the engine_forkchoiceUpdated function with payload attributes
+        let forkchoice_state = ForkchoiceState {
+            head_block_hash: genesis_hash,
+            safe_block_hash: genesis_hash,
+            finalized_block_hash: genesis_hash,
+        };
+
+        let payload_attributes = OptimismPayloadAttributes {
+            payload_attributes: PayloadAttributes {
+                timestamp: 1,
+                prev_randao: Default::default(),
+                suggested_fee_recipient: Default::default(),
+                // canyon is _not_ in the chain spec, so this should cause the engine call to fail
+                withdrawals: Some(vec![]),
+                parent_beacon_block_root: None,
+            },
+            no_tx_pool: None,
+            gas_limit: Some(1),
+            transactions: None,
+        };
+
+        // call the engine_forkchoiceUpdated function with payload attributes
+        let res = <HttpClient as EngineApiClient<OptimismEngineTypes>>::fork_choice_updated_v2(
+            &client,
+            forkchoice_state,
+            Some(payload_attributes),
+        )
+        .await;
+        res.expect("post-canyon engine call with withdrawals should succeed");
     }
 }

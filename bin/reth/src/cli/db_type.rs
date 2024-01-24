@@ -1,13 +1,14 @@
 //! A real or test database type
 
 use crate::dirs::{ChainPath, DataDirPath, MaybePlatformPath};
+use alloy_chains::Chain;
 use reth_db::{
     init_db,
+    mdbx::DatabaseArguments,
     test_utils::{create_test_rw_db, TempDatabase},
     DatabaseEnv,
 };
 use reth_interfaces::db::LogLevel;
-use reth_primitives::Chain;
 use std::{str::FromStr, sync::Arc};
 
 /// A type that represents either a _real_ (represented by a path), or _test_ database, which will
@@ -54,7 +55,10 @@ impl DatabaseBuilder {
                 let db_path = data_dir.db_path();
 
                 tracing::info!(target: "reth::cli", path = ?db_path, "Opening database");
-                let db = Arc::new(init_db(db_path.clone(), log_level)?);
+                let db = Arc::new(
+                    init_db(db_path.clone(), DatabaseArguments::default().log_level(log_level))?
+                        .with_metrics(),
+                );
                 Ok(DatabaseInstance::Real { db, data_dir })
             }
         }
@@ -101,7 +105,7 @@ impl DatabaseInstance {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use reth_primitives::Chain;
+    use alloy_chains::Chain;
 
     #[test]
     fn test_database_db_dir() {

@@ -14,10 +14,13 @@ use backon::{ConstantBuilder, Retryable};
 use clap::Parser;
 use reth_beacon_consensus::BeaconConsensus;
 use reth_config::Config;
-use reth_db::{cursor::DbCursorRO, init_db, tables, transaction::DbTx, DatabaseEnv};
+use reth_db::{
+    cursor::DbCursorRO, init_db, mdbx::DatabaseArguments, tables, transaction::DbTx, DatabaseEnv,
+};
 use reth_interfaces::{consensus::Consensus, p2p::full_block::FullBlockClient};
 use reth_network::NetworkHandle;
 use reth_network_api::NetworkInfo;
+
 use reth_primitives::{
     fs,
     stage::{StageCheckpoint, StageId},
@@ -120,7 +123,8 @@ impl Command {
         fs::create_dir_all(&db_path)?;
 
         // initialize the database
-        let db = Arc::new(init_db(db_path, self.db.log_level)?);
+        let db =
+            Arc::new(init_db(db_path, DatabaseArguments::default().log_level(self.db.log_level))?);
         let factory = ProviderFactory::new(&db, self.chain.clone());
         let provider_rw = factory.provider_rw()?;
 
@@ -178,7 +182,7 @@ impl Command {
                 Ok(senders) => senders,
                 Err(err) => {
                     warn!(target: "reth::cli", "Error sealing block with senders: {err:?}. Skipping...");
-                    continue;
+                    continue
                 }
             };
             provider_rw.insert_block(sealed_block, None)?;
@@ -205,6 +209,7 @@ impl Command {
                 max_blocks: Some(1),
                 max_changes: None,
                 max_cumulative_gas: None,
+                max_duration: None,
             },
             MERKLE_STAGE_DEFAULT_CLEAN_THRESHOLD,
             PruneModes::all(),
@@ -278,7 +283,7 @@ impl Command {
                     let clean_result = merkle_stage.execute(&provider_rw, clean_input);
                     assert!(clean_result.is_ok(), "Clean state root calculation failed");
                     if clean_result.unwrap().done {
-                        break;
+                        break
                     }
                 }
 
@@ -344,7 +349,7 @@ impl Command {
                                 clean.1.nibbles.len() > self.skip_node_depth.unwrap_or_default()
                             {
                                 first_mismatched_storage = Some((incremental, clean));
-                                break;
+                                break
                             }
                         }
                         (Some(incremental), None) => {

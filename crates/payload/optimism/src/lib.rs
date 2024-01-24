@@ -16,9 +16,12 @@ pub mod error;
 mod builder {
     use crate::error::OptimismPayloadBuilderError;
     use reth_basic_payload_builder::*;
-    use reth_payload_builder::{error::PayloadBuilderError, BuiltPayload};
+    use reth_node_api::PayloadBuilderAttributes;
+    use reth_payload_builder::{
+        error::PayloadBuilderError, EthBuiltPayload, OptimismPayloadBuilderAttributes,
+    };
     use reth_primitives::{
-        constants::BEACON_NONCE,
+        constants::{BEACON_NONCE, EMPTY_RECEIPTS, EMPTY_TRANSACTIONS},
         proofs,
         revm::{compat::into_reth_log, env::tx_env_with_recovered},
         Block, Hardfork, Header, IntoRecoveredTransaction, Receipt, Receipts,
@@ -32,8 +35,7 @@ mod builder {
         primitives::{EVMError, Env, InvalidTransaction, ResultAndState},
         DatabaseCommit, State,
     };
-    use std::sync::Arc;
-    use tracing::{debug, trace};
+    use tracing::{debug, trace, warn};
 
     /// Optimism's payload builder
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -68,30 +70,125 @@ mod builder {
         Client: StateProviderFactory,
         Pool: TransactionPool,
     {
+        type Attributes = OptimismPayloadBuilderAttributes;
+        type BuiltPayload = EthBuiltPayload;
+
         fn try_build(
             &self,
-            args: BuildArguments<Pool, Client>,
-        ) -> Result<BuildOutcome, PayloadBuilderError> {
+            args: BuildArguments<Pool, Client, OptimismPayloadBuilderAttributes, EthBuiltPayload>,
+        ) -> Result<BuildOutcome<EthBuiltPayload>, PayloadBuilderError> {
             optimism_payload_builder(args, self.compute_pending_block)
         }
 
         fn on_missing_payload(
             &self,
-            args: BuildArguments<Pool, Client>,
-        ) -> Option<Arc<BuiltPayload>> {
+            args: BuildArguments<Pool, Client, OptimismPayloadBuilderAttributes, EthBuiltPayload>,
+        ) -> Option<EthBuiltPayload> {
             // In Optimism, the PayloadAttributes can specify a `no_tx_pool` option that implies we
             // should not pull transactions from the tx pool. In this case, we build the payload
             // upfront with the list of transactions sent in the attributes without caring about
             // the results of the polling job, if a best payload has not already been built.
-            if args.config.attributes.optimism_payload_attributes.no_tx_pool {
+            if args.config.attributes.no_tx_pool {
                 if let Ok(BuildOutcome::Better { payload, .. }) = self.try_build(args) {
                     trace!(target: "payload_builder", "[OPTIMISM] Forced best payload");
-                    let payload = Arc::new(payload);
                     return Some(payload)
                 }
             }
 
             None
+        }
+
+        fn build_empty_payload(
+            client: &Client,
+            config: PayloadConfig<Self::Attributes>,
+        ) -> Result<EthBuiltPayload, PayloadBuilderError>
+        where
+            Client: StateProviderFactory,
+        {
+            let extra_data = config.extra_data();
+            let PayloadConfig {
+                initialized_block_env,
+                parent_block,
+                attributes,
+                chain_spec,
+                initialized_cfg,
+                ..
+            } = config;
+
+            debug!(target: "payload_builder", parent_hash = ?parent_block.hash, parent_number = parent_block.number, "building empty payload");
+
+            let state = client.state_by_block_hash(parent_block.hash).map_err(|err| {
+                warn!(target: "payload_builder", parent_hash=%parent_block.hash, ?err,  "failed to get state for empty payload");
+                err
+            })?;
+            let mut db = State::builder()
+                .with_database_boxed(Box::new(StateProviderDatabase::new(&state)))
+                .with_bundle_update()
+                .build();
+
+            let base_fee = initialized_block_env.basefee.to::<u64>();
+            let block_number = initialized_block_env.number.to::<u64>();
+            let block_gas_limit: u64 =
+                initialized_block_env.gas_limit.try_into().unwrap_or(u64::MAX);
+
+            // apply eip-4788 pre block contract call
+            pre_block_beacon_root_contract_call(
+                &mut db,
+                &chain_spec,
+                block_number,
+                &initialized_cfg,
+                &initialized_block_env,
+                &attributes,
+            ).map_err(|err| {
+                warn!(target: "payload_builder", parent_hash=%parent_block.hash, ?err,  "failed to apply beacon root contract call for empty payload");
+                err
+            })?;
+
+            let WithdrawalsOutcome { withdrawals_root, withdrawals } =
+                commit_withdrawals(&mut db, &chain_spec, attributes.timestamp(), attributes.withdrawals().clone()).map_err(|err| {
+                    warn!(target: "payload_builder", parent_hash=%parent_block.hash,?err,  "failed to commit withdrawals for empty payload");
+                    err
+                })?;
+
+            // merge all transitions into bundle state, this would apply the withdrawal balance
+            // changes and 4788 contract call
+            db.merge_transitions(BundleRetention::PlainState);
+
+            // calculate the state root
+            let bundle_state =
+                BundleStateWithReceipts::new(db.take_bundle(), Receipts::new(), block_number);
+            let state_root = state.state_root(&bundle_state).map_err(|err| {
+                warn!(target: "payload_builder", parent_hash=%parent_block.hash, ?err,  "failed to calculate state root for empty payload");
+                err
+            })?;
+
+            let header = Header {
+                parent_hash: parent_block.hash,
+                ommers_hash: EMPTY_OMMER_ROOT_HASH,
+                beneficiary: initialized_block_env.coinbase,
+                state_root,
+                transactions_root: EMPTY_TRANSACTIONS,
+                withdrawals_root,
+                receipts_root: EMPTY_RECEIPTS,
+                logs_bloom: Default::default(),
+                timestamp: attributes.timestamp(),
+                mix_hash: attributes.prev_randao(),
+                nonce: BEACON_NONCE,
+                base_fee_per_gas: Some(base_fee),
+                number: parent_block.number + 1,
+                gas_limit: block_gas_limit,
+                difficulty: U256::ZERO,
+                gas_used: 0,
+                extra_data,
+                blob_gas_used: None,
+                excess_blob_gas: None,
+                parent_beacon_block_root: attributes.parent_beacon_block_root(),
+            };
+
+            let block = Block { header, body: vec![], ommers: vec![], withdrawals };
+            let sealed_block = block.seal_slow();
+
+            Ok(EthBuiltPayload::new(attributes.payload_id(), sealed_block, U256::ZERO))
         }
     }
 
@@ -105,13 +202,18 @@ mod builder {
     /// a result indicating success with the payload or an error in case of failure.
     #[inline]
     pub(crate) fn optimism_payload_builder<Pool, Client>(
-        args: BuildArguments<Pool, Client>,
+        args: BuildArguments<Pool, Client, OptimismPayloadBuilderAttributes, EthBuiltPayload>,
         _compute_pending_block: bool,
-    ) -> Result<BuildOutcome, PayloadBuilderError>
+    ) -> Result<BuildOutcome<EthBuiltPayload>, PayloadBuilderError>
     where
         Client: StateProviderFactory,
         Pool: TransactionPool,
     {
+        debug_assert!(
+            args.config.initialized_cfg.optimism,
+            "optimism payload builder called on non-optimism chain"
+        );
+
         let BuildArguments { client, pool, mut cached_reads, config, cancel, best_payload } = args;
 
         let state_provider = client.state_by_block_hash(config.parent_block.hash)?;
@@ -130,10 +232,9 @@ mod builder {
             ..
         } = config;
 
-        debug!(target: "payload_builder", id=%attributes.id, parent_hash = ?parent_block.hash, parent_number = parent_block.number, "building new payload");
+        debug!(target: "payload_builder", id=%attributes.payload_id(), parent_hash = ?parent_block.hash, parent_number = parent_block.number, "building new payload");
         let mut cumulative_gas_used = 0;
         let block_gas_limit: u64 = attributes
-            .optimism_payload_attributes
             .gas_limit
             .unwrap_or(initialized_block_env.gas_limit.try_into().unwrap_or(u64::MAX));
         let base_fee = initialized_block_env.basefee.to::<u64>();
@@ -146,7 +247,7 @@ mod builder {
         let block_number = initialized_block_env.number.to::<u64>();
 
         let is_regolith =
-            chain_spec.is_fork_active_at_timestamp(Hardfork::Regolith, attributes.timestamp);
+            chain_spec.is_fork_active_at_timestamp(Hardfork::Regolith, attributes.timestamp());
 
         // Ensure that the create2deployer is force-deployed at the canyon transition. Optimism
         // blocks will always have at least a single transaction in them (the L1 info transaction),
@@ -154,7 +255,7 @@ mod builder {
         // the above check for empty blocks will never be hit on OP chains.
         reth_revm::optimism::ensure_create2_deployer(
             chain_spec.clone(),
-            attributes.timestamp,
+            attributes.timestamp(),
             &mut db,
         )
         .map_err(|_| {
@@ -162,7 +263,7 @@ mod builder {
         })?;
 
         let mut receipts = Vec::new();
-        for sequencer_tx in attributes.optimism_payload_attributes.transactions {
+        for sequencer_tx in &attributes.transactions {
             // Check if the job was cancelled, if so we can exit early.
             if cancel.is_cancelled() {
                 return Ok(BuildOutcome::Cancelled)
@@ -208,7 +309,7 @@ mod builder {
                 Err(err) => {
                     match err {
                         EVMError::Transaction(err) => {
-                            trace!(target: "optimism_payload_builder", ?err, ?sequencer_tx, "Error in sequencer transaction, skipping.");
+                            trace!(target: "payload_builder", ?err, ?sequencer_tx, "Error in sequencer transaction, skipping.");
                             continue
                         }
                         err => {
@@ -238,7 +339,7 @@ mod builder {
                 // receipt hashes should be computed when set. The state transition process
                 // ensures this is only set for post-Canyon deposit transactions.
                 deposit_receipt_version: chain_spec
-                    .is_fork_active_at_timestamp(Hardfork::Canyon, attributes.timestamp)
+                    .is_fork_active_at_timestamp(Hardfork::Canyon, attributes.timestamp())
                     .then_some(1),
             }));
 
@@ -246,7 +347,7 @@ mod builder {
             executed_txs.push(sequencer_tx.into_signed());
         }
 
-        if !attributes.optimism_payload_attributes.no_tx_pool {
+        if !attributes.no_tx_pool {
             while let Some(pool_tx) = best_txs.next() {
                 // ensure we still have capacity for this transaction
                 if cumulative_gas_used + pool_tx.gas_limit() > block_gas_limit {
@@ -331,13 +432,17 @@ mod builder {
         }
 
         // check if we have a better block
-        if !is_better_payload(best_payload.as_deref(), total_fees) {
+        if !is_better_payload(best_payload.as_ref(), total_fees) {
             // can skip building the block
             return Ok(BuildOutcome::Aborted { fees: total_fees, cached_reads })
         }
 
-        let WithdrawalsOutcome { withdrawals_root, withdrawals } =
-            commit_withdrawals(&mut db, &chain_spec, attributes.timestamp, attributes.withdrawals)?;
+        let WithdrawalsOutcome { withdrawals_root, withdrawals } = commit_withdrawals(
+            &mut db,
+            &chain_spec,
+            attributes.timestamp(),
+            attributes.withdrawals().clone(),
+        )?;
 
         // merge all transitions into bundle state, this would apply the withdrawal balance changes
         // and 4788 contract call
@@ -349,7 +454,7 @@ mod builder {
             block_number,
         );
         let receipts_root = bundle
-            .receipts_root_slow(block_number, chain_spec.as_ref(), attributes.timestamp)
+            .receipts_root_slow(block_number, chain_spec.as_ref(), attributes.timestamp())
             .expect("Number is in range");
         let logs_bloom = bundle.block_logs_bloom(block_number).expect("Number is in range");
 
@@ -373,8 +478,8 @@ mod builder {
             receipts_root,
             withdrawals_root,
             logs_bloom,
-            timestamp: attributes.timestamp,
-            mix_hash: attributes.prev_randao,
+            timestamp: attributes.timestamp(),
+            mix_hash: attributes.prev_randao(),
             nonce: BEACON_NONCE,
             base_fee_per_gas: Some(base_fee),
             number: parent_block.number + 1,
@@ -382,7 +487,7 @@ mod builder {
             difficulty: U256::ZERO,
             gas_used: cumulative_gas_used,
             extra_data,
-            parent_beacon_block_root: attributes.parent_beacon_block_root,
+            parent_beacon_block_root: attributes.parent_beacon_block_root(),
             blob_gas_used,
             excess_blob_gas,
         };
@@ -393,7 +498,7 @@ mod builder {
         let sealed_block = block.seal_slow();
         debug!(target: "payload_builder", ?sealed_block, "sealed built block");
 
-        let mut payload = BuiltPayload::new(attributes.id, sealed_block, total_fees);
+        let mut payload = EthBuiltPayload::new(attributes.payload_id(), sealed_block, total_fees);
 
         // extend the payload with the blob sidecars from the executed txs
         payload.extend_sidecars(blob_sidecars);

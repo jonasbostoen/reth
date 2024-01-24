@@ -16,7 +16,7 @@ use clap::Parser;
 use futures::{stream::select as stream_select, StreamExt};
 use reth_beacon_consensus::BeaconConsensus;
 use reth_config::Config;
-use reth_db::{database::Database, init_db, DatabaseEnv};
+use reth_db::{database::Database, init_db, mdbx::DatabaseArguments, DatabaseEnv};
 use reth_downloaders::{
     bodies::bodies::BodiesDownloaderBuilder,
     headers::reverse_headers::ReverseHeadersDownloaderBuilder,
@@ -27,6 +27,7 @@ use reth_interfaces::{
 };
 use reth_network::{NetworkEvents, NetworkHandle};
 use reth_network_api::NetworkInfo;
+
 use reth_primitives::{fs, stage::StageId, BlockHashOrNumber, BlockNumber, ChainSpec, B256};
 use reth_provider::{BlockExecutionWriter, HeaderSyncMode, ProviderFactory, StageCheckpointReader};
 use reth_stages::{
@@ -136,13 +137,14 @@ impl Command {
                         max_blocks: None,
                         max_changes: None,
                         max_cumulative_gas: None,
+                        max_duration: None,
                     },
                     stage_conf
                         .merkle
                         .clean_threshold
                         .max(stage_conf.account_hashing.clean_threshold)
                         .max(stage_conf.storage_hashing.clean_threshold),
-                    config.prune.as_ref().map(|prune| prune.segments.clone()).unwrap_or_default(),
+                    config.prune.clone().map(|prune| prune.segments).unwrap_or_default(),
                 )),
             )
             .build(provider_factory);
@@ -202,7 +204,8 @@ impl Command {
         let data_dir = self.datadir.unwrap_or_chain_default(self.chain.chain);
         let db_path = data_dir.db_path();
         fs::create_dir_all(&db_path)?;
-        let db = Arc::new(init_db(db_path, self.db.log_level)?);
+        let db =
+            Arc::new(init_db(db_path, DatabaseArguments::default().log_level(self.db.log_level))?);
         let provider_factory = ProviderFactory::new(db.clone(), self.chain.clone());
 
         debug!(target: "reth::cli", chain=%self.chain.chain, genesis=?self.chain.genesis_hash(), "Initializing genesis");

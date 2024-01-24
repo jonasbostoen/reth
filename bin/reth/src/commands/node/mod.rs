@@ -2,6 +2,15 @@
 //!
 //! Starts the client
 
+use clap::{value_parser, Parser};
+use reth_auto_seal_consensus::AutoSealConsensus;
+use reth_beacon_consensus::BeaconConsensus;
+use reth_interfaces::consensus::Consensus;
+use reth_primitives::ChainSpec;
+use std::{net::SocketAddr, path::PathBuf, sync::Arc};
+
+pub mod cl_events;
+pub mod events;
 use crate::{
     args::{
         utils::{chain_help, genesis_value_parser, parse_socket_address, SUPPORTED_CHAINS},
@@ -13,15 +22,6 @@ use crate::{
     dirs::{DataDirPath, MaybePlatformPath},
     runner::CliContext,
 };
-use clap::{value_parser, Parser};
-use reth_auto_seal_consensus::AutoSealConsensus;
-use reth_beacon_consensus::BeaconConsensus;
-use reth_interfaces::consensus::Consensus;
-use reth_primitives::ChainSpec;
-use std::{net::SocketAddr, path::PathBuf, sync::Arc};
-
-pub mod cl_events;
-pub mod events;
 
 /// Start the node
 #[derive(Debug, Parser)]
@@ -253,7 +253,7 @@ mod tests {
     fn parse_common_node_command_chain_args() {
         for chain in SUPPORTED_CHAINS {
             let args: NodeCommand = NodeCommand::<()>::parse_from(["reth", "--chain", chain]);
-            assert_eq!(args.chain.chain, chain.parse().unwrap());
+            assert_eq!(args.chain.chain, chain.parse::<reth_primitives::Chain>().unwrap());
         }
     }
 

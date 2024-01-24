@@ -1338,7 +1338,7 @@ impl Display for InboundConnectionError {
 }
 
 #[cfg(test)]
-mod test {
+mod tests {
     use super::PeersManager;
     use crate::{
         error::BackoffKind,
