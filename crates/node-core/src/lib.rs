@@ -6,14 +6,20 @@
     issue_tracker_base_url = "https://github.com/paradigmxyz/reth/issues/"
 )]
 #![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
-#![warn(unused_crate_dependencies)]
 
 pub mod args;
 pub mod cli;
 pub mod dirs;
+pub mod events;
+pub mod exit;
 pub mod init;
+pub mod metrics;
+pub mod node_config;
 pub mod utils;
 pub mod version;
+
+// Re-export for backwards compatibility.
+pub use metrics::prometheus_exporter;
 
 /// Re-exported from `reth_primitives`.
 pub mod primitives {

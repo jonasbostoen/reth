@@ -1,6 +1,6 @@
 use crate::{
-    Address, GotExpected, Header, SealedHeader, TransactionSigned, TransactionSignedEcRecovered,
-    Withdrawal, B256,
+    Address, Bytes, GotExpected, Header, SealedHeader, TransactionSigned,
+    TransactionSignedEcRecovered, Withdrawals, B256,
 };
 use alloy_rlp::{RlpDecodable, RlpEncodable};
 use reth_codecs::derive_arbitrary;
@@ -27,7 +27,7 @@ pub struct Block {
     /// Ommers/uncles header.
     pub ommers: Vec<Header>,
     /// Block withdrawals.
-    pub withdrawals: Option<Vec<Withdrawal>>,
+    pub withdrawals: Option<Withdrawals>,
 }
 
 impl Block {
@@ -119,7 +119,7 @@ impl Block {
             // take into account capacity
             self.body.iter().map(TransactionSigned::size).sum::<usize>() + self.body.capacity() * std::mem::size_of::<TransactionSigned>() +
             self.ommers.iter().map(Header::size).sum::<usize>() + self.ommers.capacity() * std::mem::size_of::<Header>() +
-            self.withdrawals.as_ref().map(|w| w.iter().map(Withdrawal::size).sum::<usize>() + w.capacity() * std::mem::size_of::<Withdrawal>()).unwrap_or(std::mem::size_of::<Option<Vec<Withdrawal>>>())
+            self.withdrawals.as_ref().map_or(std::mem::size_of::<Option<Withdrawals>>(), Withdrawals::total_size)
     }
 }
 
@@ -142,7 +142,7 @@ pub struct BlockWithSenders {
 impl BlockWithSenders {
     /// New block with senders. Return none if len of tx and senders does not match
     pub fn new(block: Block, senders: Vec<Address>) -> Option<Self> {
-        (!block.body.len() != senders.len()).then_some(Self { block, senders })
+        (block.body.len() == senders.len()).then_some(Self { block, senders })
     }
 
     /// Seal the block with a known hash.
@@ -219,7 +219,7 @@ pub struct SealedBlock {
     /// Ommer/uncle headers
     pub ommers: Vec<Header>,
     /// Block withdrawals.
-    pub withdrawals: Option<Vec<Withdrawal>>,
+    pub withdrawals: Option<Withdrawals>,
 }
 
 impl SealedBlock {
@@ -232,7 +232,7 @@ impl SealedBlock {
 
     /// Header hash.
     #[inline]
-    pub fn hash(&self) -> B256 {
+    pub const fn hash(&self) -> B256 {
         self.header.hash()
     }
 
@@ -316,7 +316,7 @@ impl SealedBlock {
             // take into account capacity
             self.body.iter().map(TransactionSigned::size).sum::<usize>() + self.body.capacity() * std::mem::size_of::<TransactionSigned>() +
             self.ommers.iter().map(Header::size).sum::<usize>() + self.ommers.capacity() * std::mem::size_of::<Header>() +
-            self.withdrawals.as_ref().map(|w| w.iter().map(Withdrawal::size).sum::<usize>() + w.capacity() * std::mem::size_of::<Withdrawal>()).unwrap_or(std::mem::size_of::<Option<Vec<Withdrawal>>>())
+            self.withdrawals.as_ref().map_or(std::mem::size_of::<Option<Withdrawals>>(), Withdrawals::total_size)
     }
 
     /// Calculates the total gas used by blob transactions in the sealed block.
@@ -347,6 +347,11 @@ impl SealedBlock {
         }
 
         Ok(())
+    }
+
+    /// Returns a vector of transactions RLP encoded with [TransactionSigned::encode_enveloped].
+    pub fn raw_transactions(&self) -> Vec<Bytes> {
+        self.body.iter().map(|tx| tx.envelope_encoded()).collect()
     }
 }
 
@@ -382,7 +387,7 @@ pub struct SealedBlockWithSenders {
 impl SealedBlockWithSenders {
     /// New sealed block with sender. Return none if len of tx and senders does not match
     pub fn new(block: SealedBlock, senders: Vec<Address>) -> Option<Self> {
-        (!block.body.len() != senders.len()).then_some(Self { block, senders })
+        (block.body.len() == senders.len()).then_some(Self { block, senders })
     }
 
     /// Split Structure to its components
@@ -469,11 +474,9 @@ pub struct BlockBody {
     /// Withdrawals in the block.
     #[cfg_attr(
         any(test, feature = "arbitrary"),
-        proptest(
-            strategy = "proptest::option::of(proptest::collection::vec(proptest::arbitrary::any::<Withdrawal>(), 0..=16))"
-        )
+        proptest(strategy = "proptest::option::of(proptest::arbitrary::any::<Withdrawals>())")
     )]
-    pub withdrawals: Option<Vec<Withdrawal>>,
+    pub withdrawals: Option<Withdrawals>,
 }
 
 impl BlockBody {
@@ -512,17 +515,13 @@ impl BlockBody {
             self.ommers.capacity() * std::mem::size_of::<Header>() +
             self.withdrawals
                 .as_ref()
-                .map(|w| {
-                    w.iter().map(Withdrawal::size).sum::<usize>() +
-                        w.capacity() * std::mem::size_of::<Withdrawal>()
-                })
-                .unwrap_or(std::mem::size_of::<Option<Vec<Withdrawal>>>())
+                .map_or(std::mem::size_of::<Option<Withdrawals>>(), Withdrawals::total_size)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{BlockId, BlockNumberOrTag::*, *};
+    use super::{BlockNumberOrTag::*, *};
     use crate::hex_literal::hex;
     use alloy_rlp::{Decodable, Encodable};
     use reth_rpc_types::HexStringMissingPrefixError;
@@ -678,5 +677,23 @@ mod tests {
         let s = "\"2\"";
         let err = serde_json::from_str::<BlockNumberOrTag>(s).unwrap_err();
         assert_eq!(err.to_string(), HexStringMissingPrefixError::default().to_string());
+    }
+
+    #[test]
+    fn block_with_senders() {
+        let mut block = Block::default();
+        let sender = Address::random();
+        block.body.push(TransactionSigned::default());
+        assert_eq!(BlockWithSenders::new(block.clone(), vec![]), None);
+        assert_eq!(
+            BlockWithSenders::new(block.clone(), vec![sender]),
+            Some(BlockWithSenders { block: block.clone(), senders: vec![sender] })
+        );
+        let sealed = block.seal_slow();
+        assert_eq!(SealedBlockWithSenders::new(sealed.clone(), vec![]), None);
+        assert_eq!(
+            SealedBlockWithSenders::new(sealed.clone(), vec![sender]),
+            Some(SealedBlockWithSenders { block: sealed, senders: vec![sender] })
+        );
     }
 }

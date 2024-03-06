@@ -16,23 +16,23 @@ pub mod error;
 mod builder {
     use crate::error::OptimismPayloadBuilderError;
     use reth_basic_payload_builder::*;
-    use reth_node_api::PayloadBuilderAttributes;
     use reth_payload_builder::{
         error::PayloadBuilderError, EthBuiltPayload, OptimismPayloadBuilderAttributes,
     };
     use reth_primitives::{
         constants::{BEACON_NONCE, EMPTY_RECEIPTS, EMPTY_TRANSACTIONS},
+        eip4844::calculate_excess_blob_gas,
         proofs,
-        revm::{compat::into_reth_log, env::tx_env_with_recovered},
-        Block, Hardfork, Header, IntoRecoveredTransaction, Receipt, Receipts,
+        revm::env::tx_env_with_recovered,
+        Block, Hardfork, Header, IntoRecoveredTransaction, Receipt, Receipts, TxType,
         EMPTY_OMMER_ROOT_HASH, U256,
     };
     use reth_provider::{BundleStateWithReceipts, StateProviderFactory};
     use reth_revm::database::StateProviderDatabase;
-    use reth_transaction_pool::TransactionPool;
+    use reth_transaction_pool::{BestTransactionsAttributes, TransactionPool};
     use revm::{
         db::states::bundle_state::BundleRetention,
-        primitives::{EVMError, Env, InvalidTransaction, ResultAndState},
+        primitives::{EVMError, EnvWithHandlerCfg, InvalidTransaction, ResultAndState},
         DatabaseCommit, State,
     };
     use tracing::{debug, trace, warn};
@@ -101,10 +101,7 @@ mod builder {
         fn build_empty_payload(
             client: &Client,
             config: PayloadConfig<Self::Attributes>,
-        ) -> Result<EthBuiltPayload, PayloadBuilderError>
-        where
-            Client: StateProviderFactory,
-        {
+        ) -> Result<EthBuiltPayload, PayloadBuilderError> {
             let extra_data = config.extra_data();
             let PayloadConfig {
                 initialized_block_env,
@@ -115,10 +112,10 @@ mod builder {
                 ..
             } = config;
 
-            debug!(target: "payload_builder", parent_hash = ?parent_block.hash, parent_number = parent_block.number, "building empty payload");
+            debug!(target: "payload_builder", parent_hash = ?parent_block.hash(), parent_number = parent_block.number, "building empty payload");
 
-            let state = client.state_by_block_hash(parent_block.hash).map_err(|err| {
-                warn!(target: "payload_builder", parent_hash=%parent_block.hash, ?err,  "failed to get state for empty payload");
+            let state = client.state_by_block_hash(parent_block.hash()).map_err(|err| {
+                warn!(target: "payload_builder", parent_hash=%parent_block.hash(), %err, "failed to get state for empty payload");
                 err
             })?;
             let mut db = State::builder()
@@ -140,13 +137,13 @@ mod builder {
                 &initialized_block_env,
                 &attributes,
             ).map_err(|err| {
-                warn!(target: "payload_builder", parent_hash=%parent_block.hash, ?err,  "failed to apply beacon root contract call for empty payload");
+                warn!(target: "payload_builder", parent_hash=%parent_block.hash(), %err, "failed to apply beacon root contract call for empty payload");
                 err
             })?;
 
             let WithdrawalsOutcome { withdrawals_root, withdrawals } =
-                commit_withdrawals(&mut db, &chain_spec, attributes.timestamp(), attributes.withdrawals().clone()).map_err(|err| {
-                    warn!(target: "payload_builder", parent_hash=%parent_block.hash,?err,  "failed to commit withdrawals for empty payload");
+                commit_withdrawals(&mut db, &chain_spec, attributes.payload_attributes.timestamp, attributes.payload_attributes.withdrawals.clone()).map_err(|err| {
+                    warn!(target: "payload_builder", parent_hash=%parent_block.hash(), %err, "failed to commit withdrawals for empty payload");
                     err
                 })?;
 
@@ -158,12 +155,31 @@ mod builder {
             let bundle_state =
                 BundleStateWithReceipts::new(db.take_bundle(), Receipts::new(), block_number);
             let state_root = state.state_root(&bundle_state).map_err(|err| {
-                warn!(target: "payload_builder", parent_hash=%parent_block.hash, ?err,  "failed to calculate state root for empty payload");
+                warn!(target: "payload_builder", parent_hash=%parent_block.hash(), %err, "failed to calculate state root for empty payload");
                 err
             })?;
 
+            let mut excess_blob_gas = None;
+            let mut blob_gas_used = None;
+
+            if chain_spec.is_cancun_active_at_timestamp(attributes.payload_attributes.timestamp) {
+                excess_blob_gas = if chain_spec
+                    .is_cancun_active_at_timestamp(parent_block.timestamp)
+                {
+                    let parent_excess_blob_gas = parent_block.excess_blob_gas.unwrap_or_default();
+                    let parent_blob_gas_used = parent_block.blob_gas_used.unwrap_or_default();
+                    Some(calculate_excess_blob_gas(parent_excess_blob_gas, parent_blob_gas_used))
+                } else {
+                    // for the first post-fork block, both parent.blob_gas_used and
+                    // parent.excess_blob_gas are evaluated as 0
+                    Some(calculate_excess_blob_gas(0, 0))
+                };
+
+                blob_gas_used = Some(0);
+            }
+
             let header = Header {
-                parent_hash: parent_block.hash,
+                parent_hash: parent_block.hash(),
                 ommers_hash: EMPTY_OMMER_ROOT_HASH,
                 beneficiary: initialized_block_env.coinbase,
                 state_root,
@@ -171,8 +187,8 @@ mod builder {
                 withdrawals_root,
                 receipts_root: EMPTY_RECEIPTS,
                 logs_bloom: Default::default(),
-                timestamp: attributes.timestamp(),
-                mix_hash: attributes.prev_randao(),
+                timestamp: attributes.payload_attributes.timestamp,
+                mix_hash: attributes.payload_attributes.prev_randao,
                 nonce: BEACON_NONCE,
                 base_fee_per_gas: Some(base_fee),
                 number: parent_block.number + 1,
@@ -180,15 +196,19 @@ mod builder {
                 difficulty: U256::ZERO,
                 gas_used: 0,
                 extra_data,
-                blob_gas_used: None,
-                excess_blob_gas: None,
-                parent_beacon_block_root: attributes.parent_beacon_block_root(),
+                blob_gas_used,
+                excess_blob_gas,
+                parent_beacon_block_root: attributes.payload_attributes.parent_beacon_block_root,
             };
 
             let block = Block { header, body: vec![], ommers: vec![], withdrawals };
             let sealed_block = block.seal_slow();
 
-            Ok(EthBuiltPayload::new(attributes.payload_id(), sealed_block, U256::ZERO))
+            Ok(EthBuiltPayload::new(
+                attributes.payload_attributes.payload_id(),
+                sealed_block,
+                U256::ZERO,
+            ))
         }
     }
 
@@ -209,14 +229,9 @@ mod builder {
         Client: StateProviderFactory,
         Pool: TransactionPool,
     {
-        debug_assert!(
-            args.config.initialized_cfg.optimism,
-            "optimism payload builder called on non-optimism chain"
-        );
-
         let BuildArguments { client, pool, mut cached_reads, config, cancel, best_payload } = args;
 
-        let state_provider = client.state_by_block_hash(config.parent_block.hash)?;
+        let state_provider = client.state_by_block_hash(config.parent_block.hash())?;
         let state = StateProviderDatabase::new(&state_provider);
         let mut db = State::builder()
             .with_database_ref(cached_reads.as_db(&state))
@@ -232,7 +247,7 @@ mod builder {
             ..
         } = config;
 
-        debug!(target: "payload_builder", id=%attributes.payload_id(), parent_hash = ?parent_block.hash, parent_number = parent_block.number, "building new payload");
+        debug!(target: "payload_builder", id=%attributes.payload_attributes.payload_id(), parent_hash = ?parent_block.hash(), parent_number = parent_block.number, "building new payload");
         let mut cumulative_gas_used = 0;
         let block_gas_limit: u64 = attributes
             .gas_limit
@@ -240,14 +255,29 @@ mod builder {
         let base_fee = initialized_block_env.basefee.to::<u64>();
 
         let mut executed_txs = Vec::new();
-        let mut best_txs = pool.best_transactions_with_base_fee(base_fee);
+        let mut best_txs = pool.best_transactions_with_attributes(BestTransactionsAttributes::new(
+            base_fee,
+            initialized_block_env.get_blob_gasprice().map(|gasprice| gasprice as u64),
+        ));
 
         let mut total_fees = U256::ZERO;
 
         let block_number = initialized_block_env.number.to::<u64>();
 
-        let is_regolith =
-            chain_spec.is_fork_active_at_timestamp(Hardfork::Regolith, attributes.timestamp());
+        let is_regolith = chain_spec.is_fork_active_at_timestamp(
+            Hardfork::Regolith,
+            attributes.payload_attributes.timestamp,
+        );
+
+        // apply eip-4788 pre block contract call
+        pre_block_beacon_root_contract_call(
+            &mut db,
+            &chain_spec,
+            block_number,
+            &initialized_cfg,
+            &initialized_block_env,
+            &attributes,
+        )?;
 
         // Ensure that the create2deployer is force-deployed at the canyon transition. Optimism
         // blocks will always have at least a single transaction in them (the L1 info transaction),
@@ -255,7 +285,7 @@ mod builder {
         // the above check for empty blocks will never be hit on OP chains.
         reth_revm::optimism::ensure_create2_deployer(
             chain_spec.clone(),
-            attributes.timestamp(),
+            attributes.payload_attributes.timestamp,
             &mut db,
         )
         .map_err(|_| {
@@ -267,6 +297,13 @@ mod builder {
             // Check if the job was cancelled, if so we can exit early.
             if cancel.is_cancelled() {
                 return Ok(BuildOutcome::Cancelled)
+            }
+
+            // A sequencer's block should never contain blob transactions.
+            if matches!(sequencer_tx.tx_type(), TxType::EIP4844) {
+                return Err(PayloadBuilderError::other(
+                    OptimismPayloadBuilderError::BlobTransactionRejected,
+                ))
             }
 
             // Convert the transaction to a [TransactionSignedEcRecovered]. This is
@@ -294,22 +331,21 @@ mod builder {
                     ))
                 })?;
 
-            // Configure the environment for the block.
-            let env = Env {
-                cfg: initialized_cfg.clone(),
-                block: initialized_block_env.clone(),
-                tx: tx_env_with_recovered(&sequencer_tx),
-            };
-
-            let mut evm = revm::EVM::with_env(env);
-            evm.database(&mut db);
+            let mut evm = revm::Evm::builder()
+                .with_db(&mut db)
+                .with_env_with_handler_cfg(EnvWithHandlerCfg::new_with_cfg_env(
+                    initialized_cfg.clone(),
+                    initialized_block_env.clone(),
+                    tx_env_with_recovered(&sequencer_tx),
+                ))
+                .build();
 
             let ResultAndState { result, state } = match evm.transact() {
                 Ok(res) => res,
                 Err(err) => {
                     match err {
                         EVMError::Transaction(err) => {
-                            trace!(target: "payload_builder", ?err, ?sequencer_tx, "Error in sequencer transaction, skipping.");
+                            trace!(target: "payload_builder", %err, ?sequencer_tx, "Error in sequencer transaction, skipping.");
                             continue
                         }
                         err => {
@@ -320,6 +356,8 @@ mod builder {
                 }
             };
 
+            // to realease the db reference drop evm.
+            drop(evm);
             // commit changes
             db.commit(state);
 
@@ -333,13 +371,16 @@ mod builder {
                 tx_type: sequencer_tx.tx_type(),
                 success: result.is_success(),
                 cumulative_gas_used,
-                logs: result.logs().into_iter().map(into_reth_log).collect(),
+                logs: result.logs().into_iter().map(Into::into).collect(),
                 deposit_nonce: depositor.map(|account| account.nonce),
                 // The deposit receipt version was introduced in Canyon to indicate an update to how
                 // receipt hashes should be computed when set. The state transition process
                 // ensures this is only set for post-Canyon deposit transactions.
                 deposit_receipt_version: chain_spec
-                    .is_fork_active_at_timestamp(Hardfork::Canyon, attributes.timestamp())
+                    .is_fork_active_at_timestamp(
+                        Hardfork::Canyon,
+                        attributes.payload_attributes.timestamp,
+                    )
                     .then_some(1),
             }));
 
@@ -358,6 +399,13 @@ mod builder {
                     continue
                 }
 
+                // A sequencer's block should never contain blob transactions.
+                if pool_tx.tx_type() == TxType::EIP4844 as u8 {
+                    return Err(PayloadBuilderError::other(
+                        OptimismPayloadBuilderError::BlobTransactionRejected,
+                    ))
+                }
+
                 // check if the job was cancelled, if so we can exit early
                 if cancel.is_cancelled() {
                     return Ok(BuildOutcome::Cancelled)
@@ -367,14 +415,14 @@ mod builder {
                 let tx = pool_tx.to_recovered_transaction();
 
                 // Configure the environment for the block.
-                let env = Env {
-                    cfg: initialized_cfg.clone(),
-                    block: initialized_block_env.clone(),
-                    tx: tx_env_with_recovered(&tx),
-                };
-
-                let mut evm = revm::EVM::with_env(env);
-                evm.database(&mut db);
+                let mut evm = revm::Evm::builder()
+                    .with_db(&mut db)
+                    .with_env_with_handler_cfg(EnvWithHandlerCfg::new_with_cfg_env(
+                        initialized_cfg.clone(),
+                        initialized_block_env.clone(),
+                        tx_env_with_recovered(&tx),
+                    ))
+                    .build();
 
                 let ResultAndState { result, state } = match evm.transact() {
                     Ok(res) => res,
@@ -383,11 +431,11 @@ mod builder {
                             EVMError::Transaction(err) => {
                                 if matches!(err, InvalidTransaction::NonceTooLow { .. }) {
                                     // if the nonce is too low, we can skip this transaction
-                                    trace!(target: "payload_builder", ?err, ?tx, "skipping nonce too low transaction");
+                                    trace!(target: "payload_builder", %err, ?tx, "skipping nonce too low transaction");
                                 } else {
                                     // if the transaction is invalid, we can skip it and all of its
                                     // descendants
-                                    trace!(target: "payload_builder", ?err, ?tx, "skipping invalid transaction and its descendants");
+                                    trace!(target: "payload_builder", %err, ?tx, "skipping invalid transaction and its descendants");
                                     best_txs.mark_invalid(&pool_tx);
                                 }
 
@@ -400,7 +448,8 @@ mod builder {
                         }
                     }
                 };
-
+                // drop evm so db is released.
+                drop(evm);
                 // commit changes
                 db.commit(state);
 
@@ -415,7 +464,7 @@ mod builder {
                     tx_type: tx.tx_type(),
                     success: result.is_success(),
                     cumulative_gas_used,
-                    logs: result.logs().into_iter().map(into_reth_log).collect(),
+                    logs: result.logs().into_iter().map(Into::into).collect(),
                     deposit_nonce: None,
                     deposit_receipt_version: None,
                 }));
@@ -440,8 +489,8 @@ mod builder {
         let WithdrawalsOutcome { withdrawals_root, withdrawals } = commit_withdrawals(
             &mut db,
             &chain_spec,
-            attributes.timestamp(),
-            attributes.withdrawals().clone(),
+            attributes.payload_attributes.timestamp,
+            attributes.payload_attributes.withdrawals,
         )?;
 
         // merge all transitions into bundle state, this would apply the withdrawal balance changes
@@ -454,7 +503,11 @@ mod builder {
             block_number,
         );
         let receipts_root = bundle
-            .receipts_root_slow(block_number, chain_spec.as_ref(), attributes.timestamp())
+            .receipts_root_slow(
+                block_number,
+                chain_spec.as_ref(),
+                attributes.payload_attributes.timestamp,
+            )
             .expect("Number is in range");
         let logs_bloom = bundle.block_logs_bloom(block_number).expect("Number is in range");
 
@@ -464,13 +517,28 @@ mod builder {
         // create the block header
         let transactions_root = proofs::calculate_transaction_root(&executed_txs);
 
-        // Cancun is not yet active on Optimism chains.
+        // initialize empty blob sidecars. There are no blob transactions on L2.
         let blob_sidecars = Vec::new();
-        let excess_blob_gas = None;
-        let blob_gas_used = None;
+        let mut excess_blob_gas = None;
+        let mut blob_gas_used = None;
+
+        // only determine cancun fields when active
+        if chain_spec.is_cancun_active_at_timestamp(attributes.payload_attributes.timestamp) {
+            excess_blob_gas = if chain_spec.is_cancun_active_at_timestamp(parent_block.timestamp) {
+                let parent_excess_blob_gas = parent_block.excess_blob_gas.unwrap_or_default();
+                let parent_blob_gas_used = parent_block.blob_gas_used.unwrap_or_default();
+                Some(calculate_excess_blob_gas(parent_excess_blob_gas, parent_blob_gas_used))
+            } else {
+                // for the first post-fork block, both parent.blob_gas_used and
+                // parent.excess_blob_gas are evaluated as 0
+                Some(calculate_excess_blob_gas(0, 0))
+            };
+
+            blob_gas_used = Some(0);
+        }
 
         let header = Header {
-            parent_hash: parent_block.hash,
+            parent_hash: parent_block.hash(),
             ommers_hash: EMPTY_OMMER_ROOT_HASH,
             beneficiary: initialized_block_env.coinbase,
             state_root,
@@ -478,8 +546,8 @@ mod builder {
             receipts_root,
             withdrawals_root,
             logs_bloom,
-            timestamp: attributes.timestamp(),
-            mix_hash: attributes.prev_randao(),
+            timestamp: attributes.payload_attributes.timestamp,
+            mix_hash: attributes.payload_attributes.prev_randao,
             nonce: BEACON_NONCE,
             base_fee_per_gas: Some(base_fee),
             number: parent_block.number + 1,
@@ -487,7 +555,7 @@ mod builder {
             difficulty: U256::ZERO,
             gas_used: cumulative_gas_used,
             extra_data,
-            parent_beacon_block_root: attributes.parent_beacon_block_root(),
+            parent_beacon_block_root: attributes.payload_attributes.parent_beacon_block_root,
             blob_gas_used,
             excess_blob_gas,
         };
@@ -498,7 +566,8 @@ mod builder {
         let sealed_block = block.seal_slow();
         debug!(target: "payload_builder", ?sealed_block, "sealed built block");
 
-        let mut payload = EthBuiltPayload::new(attributes.payload_id(), sealed_block, total_fees);
+        let mut payload =
+            EthBuiltPayload::new(attributes.payload_attributes.id, sealed_block, total_fees);
 
         // extend the payload with the blob sidecars from the executed txs
         payload.extend_sidecars(blob_sidecars);

@@ -33,6 +33,8 @@ reth-provider.workspace = true
 reth-rpc-types.workspace = true
 reth-tokio-util.workspace = true
 
+# ethereum
+enr = { workspace = true, features = ["rust-secp256k1"], optional = true }
 alloy-rlp.workspace = true
 
 # async/futures
@@ -44,7 +46,7 @@ tokio-util = { workspace = true, features = ["codec"] }
 
 # io
 serde = { workspace = true, optional = true }
-humantime-serde = { version = "1.1", optional = true }
+humantime-serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 
 # metrics
@@ -58,7 +60,6 @@ tracing.workspace = true
 fnv = "1.0"
 thiserror.workspace = true
 parking_lot.workspace = true
-async-trait.workspace = true
 linked_hash_set = "0.1"
 linked-hash-map = "0.5.6"
 rand.workspace = true
@@ -66,9 +67,8 @@ secp256k1 = { workspace = true, features = ["global-context", "rand-std", "recov
 derive_more.workspace = true
 schnellru.workspace = true
 itertools.workspace = true
-
-enr = { workspace = true, features = ["rust-secp256k1"], optional = true }
 tempfile = { workspace = true, optional = true }
+smallvec.workspace = true
 
 [dev-dependencies]
 # reth

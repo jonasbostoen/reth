@@ -206,8 +206,6 @@ impl<EF: ExecutorFactory> ExecutionStage<EF> {
             "Execution time"
         );
 
-        executor.stats().log_info();
-
         let done = stage_progress == max_block;
         Ok(ExecOutput {
             checkpoint: StageCheckpoint::new(stage_progress)
@@ -502,18 +500,20 @@ mod tests {
     use assert_matches::assert_matches;
     use reth_db::{models::AccountBeforeTx, test_utils::create_test_rw_db};
     use reth_interfaces::executor::BlockValidationError;
+    use reth_node_ethereum::EthEvmConfig;
     use reth_primitives::{
         address, hex_literal::hex, keccak256, stage::StageUnitCheckpoint, Account, Bytecode,
-        ChainSpecBuilder, PruneModes, SealedBlock, StorageEntry, B256, MAINNET, U256,
+        ChainSpecBuilder, SealedBlock, StorageEntry, B256, MAINNET,
     };
     use reth_provider::{AccountReader, BlockWriter, ProviderFactory, ReceiptProvider};
     use reth_revm::EvmProcessorFactory;
     use std::sync::Arc;
 
-    fn stage() -> ExecutionStage<EvmProcessorFactory> {
-        let executor_factory = EvmProcessorFactory::new(Arc::new(
-            ChainSpecBuilder::mainnet().berlin_activated().build(),
-        ));
+    fn stage() -> ExecutionStage<EvmProcessorFactory<EthEvmConfig>> {
+        let executor_factory = EvmProcessorFactory::new(
+            Arc::new(ChainSpecBuilder::mainnet().berlin_activated().build()),
+            EthEvmConfig::default(),
+        );
         ExecutionStage::new(
             executor_factory,
             ExecutionStageThresholds {
@@ -701,7 +701,7 @@ mod tests {
         provider.commit().unwrap();
 
         let provider = factory.provider_rw().unwrap();
-        let mut execution_stage: ExecutionStage<EvmProcessorFactory> = stage();
+        let mut execution_stage: ExecutionStage<EvmProcessorFactory<EthEvmConfig>> = stage();
         let output = execution_stage.execute(&provider, input).unwrap();
         provider.commit().unwrap();
         assert_matches!(output, ExecOutput {

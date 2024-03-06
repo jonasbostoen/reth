@@ -11,7 +11,7 @@
 )]
 #![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
 
-use igd::aio::search_gateway;
+use igd_next::aio::tokio::search_gateway;
 use pin_project_lite::pin_project;
 use std::{
     fmt,
@@ -244,14 +244,14 @@ async fn resolve_external_ip_upnp() -> Option<IpAddr> {
     search_gateway(Default::default())
         .await
         .map_err(|err| {
-            debug!(target: "net::nat", ?err, "Failed to resolve external IP via UPnP: failed to find gateway");
+            debug!(target: "net::nat", %err, "Failed to resolve external IP via UPnP: failed to find gateway");
             err
         })
         .ok()?
         .get_external_ip()
         .await
         .map_err(|err| {
-            debug!(target: "net::nat", ?err, "Failed to resolve external IP via UPnP");
+            debug!(target: "net::nat", %err, "Failed to resolve external IP via UPnP");
             err
         })
         .ok()

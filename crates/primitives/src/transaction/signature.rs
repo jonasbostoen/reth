@@ -42,18 +42,16 @@ impl Compact for Signature {
     where
         B: bytes::BufMut + AsMut<[u8]>,
     {
-        buf.put_slice(self.r.as_le_bytes().as_ref());
-        buf.put_slice(self.s.as_le_bytes().as_ref());
+        buf.put_slice(&self.r.as_le_bytes());
+        buf.put_slice(&self.s.as_le_bytes());
         self.odd_y_parity as usize
     }
 
     fn from_compact(mut buf: &[u8], identifier: usize) -> (Self, &[u8]) {
-        let r = U256::try_from_le_slice(&buf[..32]).expect("qed");
-        buf.advance(32);
-
-        let s = U256::try_from_le_slice(&buf[..32]).expect("qed");
-        buf.advance(32);
-
+        assert!(buf.len() >= 64);
+        let r = U256::from_le_slice(&buf[0..32]);
+        let s = U256::from_le_slice(&buf[32..64]);
+        buf.advance(64);
         (Signature { r, s, odd_y_parity: identifier != 0 }, buf)
     }
 }
@@ -181,7 +179,7 @@ impl Signature {
 
     /// Turn this signature into its hex-encoded representation.
     pub fn to_hex_bytes(&self) -> Bytes {
-        crate::hex::encode(self.to_bytes()).into()
+        self.to_bytes().into()
     }
 
     /// Calculates a heuristic for the in-memory size of the [Signature].
@@ -194,7 +192,7 @@ impl Signature {
 #[cfg(test)]
 mod tests {
     use crate::{transaction::signature::SECP256K1N_HALF, Address, Signature, B256, U256};
-    use alloy_primitives::hex;
+    use alloy_primitives::{hex, hex::FromHex, Bytes};
     use bytes::BytesMut;
     use std::str::FromStr;
 
@@ -313,6 +311,24 @@ mod tests {
         };
 
         assert!(signature.size() >= 65);
+    }
+
+    #[test]
+    fn test_to_hex_bytes() {
+        let signature = Signature {
+            r: U256::from_str(
+                "18515461264373351373200002665853028612451056578545711640558177340181847433846",
+            )
+            .unwrap(),
+            s: U256::from_str(
+                "46948507304638947509940763649030358759909902576025900602547168820602576006531",
+            )
+            .unwrap(),
+            odd_y_parity: false,
+        };
+
+        let expected = Bytes::from_hex("0x28ef61340bd939bc2195fe537567866003e1a15d3c71ff63e1590620aa63627667cbe9d8997f761aecb703304b3800ccf555c9f3dc64214b297fb1966a3b6d831b").unwrap();
+        assert_eq!(signature.to_hex_bytes(), expected);
     }
 
     #[test]

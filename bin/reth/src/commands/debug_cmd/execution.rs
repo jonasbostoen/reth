@@ -6,10 +6,8 @@ use crate::{
         utils::{chain_help, genesis_value_parser, SUPPORTED_CHAINS},
         DatabaseArgs, NetworkArgs,
     },
-    commands::node::events,
+    core::cli::runner::CliContext,
     dirs::{DataDirPath, MaybePlatformPath},
-    init::init_genesis,
-    runner::CliContext,
     utils::get_single_header,
 };
 use clap::Parser;
@@ -27,7 +25,8 @@ use reth_interfaces::{
 };
 use reth_network::{NetworkEvents, NetworkHandle};
 use reth_network_api::NetworkInfo;
-
+use reth_node_core::init::init_genesis;
+use reth_node_ethereum::EthEvmConfig;
 use reth_primitives::{fs, stage::StageId, BlockHashOrNumber, BlockNumber, ChainSpec, B256};
 use reth_provider::{BlockExecutionWriter, HeaderSyncMode, ProviderFactory, StageCheckpointReader};
 use reth_stages::{
@@ -110,7 +109,8 @@ impl Command {
         let stage_conf = &config.stages;
 
         let (tip_tx, tip_rx) = watch::channel(B256::ZERO);
-        let factory = reth_revm::EvmProcessorFactory::new(self.chain.clone());
+        let factory =
+            reth_revm::EvmProcessorFactory::new(self.chain.clone(), EthEvmConfig::default());
 
         let header_mode = HeaderSyncMode::Tip(tip_rx);
         let pipeline = Pipeline::builder()
@@ -188,7 +188,7 @@ impl Command {
             match get_single_header(&client, BlockHashOrNumber::Number(block)).await {
                 Ok(tip_header) => {
                     info!(target: "reth::cli", ?block, "Successfully fetched block");
-                    return Ok(tip_header.hash)
+                    return Ok(tip_header.hash())
                 }
                 Err(error) => {
                     error!(target: "reth::cli", ?block, %error, "Failed to fetch the block. Retrying...");
@@ -252,7 +252,12 @@ impl Command {
         );
         ctx.task_executor.spawn_critical(
             "events task",
-            events::handle_events(Some(network.clone()), latest_block_number, events, db.clone()),
+            reth_node_core::events::node::handle_events(
+                Some(network.clone()),
+                latest_block_number,
+                events,
+                db.clone(),
+            ),
         );
 
         let mut current_max_block = latest_block_number.unwrap_or_default();

@@ -12,6 +12,8 @@
     html_favicon_url = "https://avatars0.githubusercontent.com/u/97369466?s=256",
     issue_tracker_base_url = "https://github.com/paradigmxyz/reth/issues/"
 )]
+// TODO: remove when https://github.com/proptest-rs/proptest/pull/427 is merged
+#![allow(unknown_lints, non_local_definitions)]
 #![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
 
 mod account;
@@ -60,7 +62,7 @@ pub use constants::{
 };
 pub use error::{GotExpected, GotExpectedBoxed};
 pub use genesis::{ChainConfig, Genesis, GenesisAccount};
-pub use header::{Header, HeadersDirection, SealedHeader};
+pub use header::{Header, HeaderValidationError, HeadersDirection, SealedHeader};
 pub use integer_list::IntegerList;
 pub use log::{logs_bloom, Log};
 pub use net::{
@@ -73,7 +75,6 @@ pub use prune::{
     ReceiptsLogPruneConfig, MINIMUM_PRUNING_DISTANCE,
 };
 pub use receipt::{Receipt, ReceiptWithBloom, ReceiptWithBloomRef, Receipts};
-pub use serde_helper::JsonU256;
 pub use snapshot::SnapshotSegment;
 pub use storage::StorageEntry;
 
@@ -92,16 +93,17 @@ pub use transaction::{
     TxEip4844, TxHashOrNumber, TxLegacy, TxType, TxValue, EIP1559_TX_TYPE_ID, EIP2930_TX_TYPE_ID,
     EIP4844_TX_TYPE_ID, LEGACY_TX_TYPE_ID,
 };
-pub use withdrawal::Withdrawal;
+pub use withdrawal::{Withdrawal, Withdrawals};
 
 // Re-exports
 pub use self::ruint::UintTryTo;
 pub use alloy_primitives::{
     self, address, b256, bloom, bytes,
     bytes::{Buf, BufMut, BytesMut},
-    eip191_hash_message, hex, hex_literal, keccak256, ruint, Address, BlockHash, BlockNumber,
-    Bloom, BloomInput, Bytes, ChainId, Selector, StorageKey, StorageValue, TxHash, TxIndex,
-    TxNumber, B128, B256, B512, B64, U128, U256, U64, U8,
+    eip191_hash_message, hex, hex_literal, keccak256, ruint,
+    utils::format_ether,
+    Address, BlockHash, BlockNumber, Bloom, BloomInput, Bytes, ChainId, Selector, StorageKey,
+    StorageValue, TxHash, TxIndex, TxNumber, B128, B256, B512, B64, U128, U256, U64, U8,
 };
 pub use reth_ethereum_forks::*;
 pub use revm_primitives::{self, JumpMap};
@@ -132,7 +134,7 @@ pub use c_kzg as kzg;
 #[cfg(feature = "optimism")]
 mod optimism {
     pub use crate::{
-        chain::{BASE_GOERLI, BASE_MAINNET, BASE_SEPOLIA, OP_GOERLI},
+        chain::{BASE_MAINNET, BASE_SEPOLIA},
         transaction::{TxDeposit, DEPOSIT_TX_TYPE_ID},
     };
 }
