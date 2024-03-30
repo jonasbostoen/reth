@@ -10,8 +10,8 @@ use reth_transaction_pool::{
     TXPOOL_SUBPOOL_MAX_SIZE_MB_DEFAULT, TXPOOL_SUBPOOL_MAX_TXS_DEFAULT,
 };
 /// Parameters for debugging purposes
-#[derive(Debug, Clone, Args, PartialEq)]
-#[clap(next_help_heading = "TxPool")]
+#[derive(Debug, Clone, Args, PartialEq, Eq)]
+#[command(next_help_heading = "TxPool")]
 pub struct TxPoolArgs {
     /// Max number of transaction in the pending sub-pool.
     #[arg(long = "txpool.pending_max_count", default_value_t = TXPOOL_SUBPOOL_MAX_TXS_DEFAULT)]
@@ -128,7 +128,7 @@ mod tests {
     /// A helper type to parse Args more easily
     #[derive(Parser)]
     struct CommandParser<T: Args> {
-        #[clap(flatten)]
+        #[command(flatten)]
         args: T,
     }
 

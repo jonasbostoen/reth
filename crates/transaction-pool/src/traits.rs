@@ -494,8 +494,7 @@ impl PropagateKind {
     /// Returns the peer the transaction was sent to
     pub const fn peer(&self) -> &PeerId {
         match self {
-            PropagateKind::Full(peer) => peer,
-            PropagateKind::Hash(peer) => peer,
+            PropagateKind::Full(peer) | PropagateKind::Hash(peer) => peer,
         }
     }
 }
@@ -503,8 +502,7 @@ impl PropagateKind {
 impl From<PropagateKind> for PeerId {
     fn from(value: PropagateKind) -> Self {
         match value {
-            PropagateKind::Full(peer) => peer,
-            PropagateKind::Hash(peer) => peer,
+            PropagateKind::Full(peer) | PropagateKind::Hash(peer) => peer,
         }
     }
 }
@@ -848,10 +846,6 @@ pub trait PoolTransaction:
 
     /// Returns chain_id
     fn chain_id(&self) -> Option<u64>;
-
-    /// Returns whether or not the transaction is an Optimism Deposited transaction.
-    #[cfg(feature = "optimism")]
-    fn is_deposit(&self) -> bool;
 }
 
 /// An extension trait that provides additional interfaces for the
@@ -915,25 +909,37 @@ pub enum EthBlobTransactionSidecar {
 
 impl EthPooledTransaction {
     /// Create new instance of [Self].
+    ///
+    /// Caution: In case of blob transactions, this does marks the blob sidecar as
+    /// [EthBlobTransactionSidecar::Missing]
     pub fn new(transaction: TransactionSignedEcRecovered, encoded_length: usize) -> Self {
         let mut blob_sidecar = EthBlobTransactionSidecar::None;
+
+        #[allow(unreachable_patterns)]
         let gas_cost = match &transaction.transaction {
-            Transaction::Legacy(t) => U256::from(t.gas_price) * U256::from(t.gas_limit),
-            Transaction::Eip2930(t) => U256::from(t.gas_price) * U256::from(t.gas_limit),
-            Transaction::Eip1559(t) => U256::from(t.max_fee_per_gas) * U256::from(t.gas_limit),
+            Transaction::Legacy(t) => {
+                U256::from(t.gas_price).saturating_mul(U256::from(t.gas_limit))
+            }
+            Transaction::Eip2930(t) => {
+                U256::from(t.gas_price).saturating_mul(U256::from(t.gas_limit))
+            }
+            Transaction::Eip1559(t) => {
+                U256::from(t.max_fee_per_gas).saturating_mul(U256::from(t.gas_limit))
+            }
             Transaction::Eip4844(t) => {
                 blob_sidecar = EthBlobTransactionSidecar::Missing;
-                U256::from(t.max_fee_per_gas) * U256::from(t.gas_limit)
+                U256::from(t.max_fee_per_gas).saturating_mul(U256::from(t.gas_limit))
             }
-            #[cfg(feature = "optimism")]
-            Transaction::Deposit(_) => U256::ZERO,
+            _ => U256::ZERO,
         };
-        let mut cost: U256 = transaction.value().into();
-        cost += gas_cost;
+        let mut cost = transaction.value();
+        cost = cost.saturating_add(gas_cost);
 
         if let Some(blob_tx) = transaction.as_eip4844() {
-            // add max blob cost
-            cost += U256::from(blob_tx.max_fee_per_blob_gas * blob_tx.blob_gas() as u128);
+            // Add max blob cost using saturating math to avoid overflow
+            cost = cost.saturating_add(U256::from(
+                blob_tx.max_fee_per_blob_gas.saturating_mul(blob_tx.blob_gas() as u128),
+            ));
         }
 
         Self { transaction, cost, encoded_length, blob_sidecar }
@@ -1004,13 +1010,13 @@ impl PoolTransaction for EthPooledTransaction {
     ///
     /// This is also commonly referred to as the "Gas Fee Cap" (`GasFeeCap`).
     fn max_fee_per_gas(&self) -> u128 {
+        #[allow(unreachable_patterns)]
         match &self.transaction.transaction {
             Transaction::Legacy(tx) => tx.gas_price,
             Transaction::Eip2930(tx) => tx.gas_price,
             Transaction::Eip1559(tx) => tx.max_fee_per_gas,
             Transaction::Eip4844(tx) => tx.max_fee_per_gas,
-            #[cfg(feature = "optimism")]
-            Transaction::Deposit(_) => 0,
+            _ => 0,
         }
     }
 
@@ -1022,12 +1028,12 @@ impl PoolTransaction for EthPooledTransaction {
     ///
     /// This will return `None` for non-EIP1559 transactions
     fn max_priority_fee_per_gas(&self) -> Option<u128> {
+        #[allow(unreachable_patterns)]
         match &self.transaction.transaction {
             Transaction::Legacy(_) | Transaction::Eip2930(_) => None,
             Transaction::Eip1559(tx) => Some(tx.max_priority_fee_per_gas),
             Transaction::Eip4844(tx) => Some(tx.max_priority_fee_per_gas),
-            #[cfg(feature = "optimism")]
-            Transaction::Deposit(_) => None,
+            _ => None,
         }
     }
 
@@ -1077,12 +1083,6 @@ impl PoolTransaction for EthPooledTransaction {
     /// Returns chain_id
     fn chain_id(&self) -> Option<u64> {
         self.transaction.chain_id()
-    }
-
-    /// Returns whether or not the transaction is an Optimism Deposited transaction.
-    #[cfg(feature = "optimism")]
-    fn is_deposit(&self) -> bool {
-        matches!(self.transaction.transaction, Transaction::Deposit(_))
     }
 }
 

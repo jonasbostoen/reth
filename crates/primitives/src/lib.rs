@@ -12,6 +12,7 @@
     html_favicon_url = "https://avatars0.githubusercontent.com/u/97369466?s=256",
     issue_tracker_base_url = "https://github.com/paradigmxyz/reth/issues/"
 )]
+#![cfg_attr(not(test), warn(unused_crate_dependencies))]
 // TODO: remove when https://github.com/proptest-rs/proptest/pull/427 is merged
 #![allow(unknown_lints, non_local_definitions)]
 #![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
@@ -20,6 +21,7 @@ mod account;
 pub mod basefee;
 mod block;
 mod chain;
+#[cfg(feature = "zstd-codec")]
 mod compression;
 pub mod constants;
 pub mod eip4844;
@@ -37,8 +39,8 @@ mod receipt;
 /// Helpers for working with revm
 pub mod revm;
 pub mod serde_helper;
-pub mod snapshot;
 pub mod stage;
+pub mod static_file;
 mod storage;
 /// Helpers for working with transactions
 pub mod transaction;
@@ -46,6 +48,8 @@ pub mod trie;
 mod withdrawal;
 
 pub use account::{Account, Bytecode};
+#[cfg(any(test, feature = "arbitrary"))]
+pub use block::{generate_valid_header, valid_header_strategy};
 pub use block::{
     Block, BlockBody, BlockHashOrNumber, BlockId, BlockNumHash, BlockNumberOrTag, BlockWithSenders,
     ForkBlock, RpcBlockHash, SealedBlock, SealedBlockWithSenders,
@@ -55,6 +59,7 @@ pub use chain::{
     ChainSpecBuilder, DisplayHardforks, ForkBaseFeeParams, ForkCondition, ForkTimestamps,
     NamedChain, DEV, GOERLI, HOLESKY, MAINNET, SEPOLIA,
 };
+#[cfg(feature = "zstd-codec")]
 pub use compression::*;
 pub use constants::{
     DEV_GENESIS_HASH, EMPTY_OMMER_ROOT_HASH, GOERLI_GENESIS_HASH, HOLESKY_GENESIS_HASH,
@@ -69,13 +74,13 @@ pub use net::{
     goerli_nodes, holesky_nodes, mainnet_nodes, parse_nodes, sepolia_nodes, NodeRecord,
     GOERLI_BOOTNODES, HOLESKY_BOOTNODES, MAINNET_BOOTNODES, SEPOLIA_BOOTNODES,
 };
-pub use peer::{PeerId, WithPeerId};
+pub use peer::{AnyNode, PeerId, WithPeerId};
 pub use prune::{
-    PruneCheckpoint, PruneMode, PruneModes, PruneProgress, PruneSegment, PruneSegmentError,
-    ReceiptsLogPruneConfig, MINIMUM_PRUNING_DISTANCE,
+    PruneCheckpoint, PruneMode, PruneModes, PruneProgress, PrunePurpose, PruneSegment,
+    PruneSegmentError, ReceiptsLogPruneConfig, MINIMUM_PRUNING_DISTANCE,
 };
 pub use receipt::{Receipt, ReceiptWithBloom, ReceiptWithBloomRef, Receipts};
-pub use snapshot::SnapshotSegment;
+pub use static_file::StaticFileSegment;
 pub use storage::StorageEntry;
 
 #[cfg(feature = "c-kzg")]
@@ -90,7 +95,7 @@ pub use transaction::{
     AccessList, AccessListItem, FromRecoveredTransaction, IntoRecoveredTransaction,
     InvalidTransactionError, Signature, Transaction, TransactionKind, TransactionMeta,
     TransactionSigned, TransactionSignedEcRecovered, TransactionSignedNoHash, TxEip1559, TxEip2930,
-    TxEip4844, TxHashOrNumber, TxLegacy, TxType, TxValue, EIP1559_TX_TYPE_ID, EIP2930_TX_TYPE_ID,
+    TxEip4844, TxHashOrNumber, TxLegacy, TxType, EIP1559_TX_TYPE_ID, EIP2930_TX_TYPE_ID,
     EIP4844_TX_TYPE_ID, LEGACY_TX_TYPE_ID,
 };
 pub use withdrawal::{Withdrawal, Withdrawals};
@@ -134,7 +139,7 @@ pub use c_kzg as kzg;
 #[cfg(feature = "optimism")]
 mod optimism {
     pub use crate::{
-        chain::{BASE_MAINNET, BASE_SEPOLIA},
+        chain::{BASE_MAINNET, BASE_SEPOLIA, OP_SEPOLIA},
         transaction::{TxDeposit, DEPOSIT_TX_TYPE_ID},
     };
 }

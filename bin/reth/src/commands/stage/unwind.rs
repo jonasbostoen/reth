@@ -8,10 +8,7 @@ use crate::{
     dirs::{DataDirPath, MaybePlatformPath},
 };
 use clap::{Parser, Subcommand};
-use reth_db::{
-    cursor::DbCursorRO, database::Database, mdbx::DatabaseArguments, open_db, tables,
-    transaction::DbTx,
-};
+use reth_db::{cursor::DbCursorRO, database::Database, open_db, tables, transaction::DbTx};
 use reth_primitives::{BlockHashOrNumber, ChainSpec};
 use reth_provider::{BlockExecutionWriter, ProviderFactory};
 use std::{ops::RangeInclusive, sync::Arc};
@@ -42,10 +39,10 @@ pub struct Command {
     )]
     chain: Arc<ChainSpec>,
 
-    #[clap(flatten)]
+    #[command(flatten)]
     db: DatabaseArgs,
 
-    #[clap(subcommand)]
+    #[command(subcommand)]
     command: Subcommands,
 }
 
@@ -59,8 +56,7 @@ impl Command {
             eyre::bail!("Database {db_path:?} does not exist.")
         }
 
-        let db =
-            open_db(db_path.as_ref(), DatabaseArguments::default().log_level(self.db.log_level))?;
+        let db = open_db(db_path.as_ref(), self.db.database_args())?;
 
         let range = self.command.unwind_range(&db)?;
 
@@ -68,7 +64,7 @@ impl Command {
             eyre::bail!("Cannot unwind genesis block")
         }
 
-        let factory = ProviderFactory::new(&db, self.chain.clone());
+        let factory = ProviderFactory::new(&db, self.chain.clone(), data_dir.static_files_path())?;
         let provider = factory.provider_rw()?;
 
         let blocks_and_execution = provider
@@ -87,10 +83,10 @@ impl Command {
 #[derive(Subcommand, Debug, Eq, PartialEq)]
 enum Subcommands {
     /// Unwinds the database until the given block number (range is inclusive).
-    #[clap(name = "to-block")]
+    #[command(name = "to-block")]
     ToBlock { target: BlockHashOrNumber },
     /// Unwinds the given number of blocks from the database.
-    #[clap(name = "num-blocks")]
+    #[command(name = "num-blocks")]
     NumBlocks { amount: u64 },
 }
 
